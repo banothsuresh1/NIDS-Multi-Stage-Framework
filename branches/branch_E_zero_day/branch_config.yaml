@@ -1,0 +1,22 @@
+# Branch E -- zero-day, leave-one-attack-out.
+# Everything (preprocessing, feature selection, imbalance handling, models,
+# calibration, fusion weights) is refit per held-out family.
+run:
+  name: "branch_E_zero_day"
+  output_dir: "branches/branch_E_zero_day/results"
+imbalance:
+  mode: "both"
+split:
+  strategy: "loao"
+branch_e:
+  # null -> loop over every family in labels.attack_families
+  families: null
+  # Skip a family with fewer than this many flows (nothing to measure).
+  min_family_flows: 5
+
+smoke:
+  # Each held-out family refits the whole pipeline, so the smoke run covers a
+  # representative subset: one high-volume family, one mid, one rare. Pass
+  # --families or set branch_e.families to override.
+  branch_e:
+    families: ["PortScan", "Brute Force", "Botnet"]

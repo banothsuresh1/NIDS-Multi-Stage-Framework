@@ -273,10 +273,53 @@ def _keras_class_weight(y: np.ndarray, n_classes: int) -> Dict[int, float]:
     return {i: (len(y) / (present * c) if c > 0 else 0.0) for i, c in enumerate(counts)}
 
 
+
+class KerasModelIO:
+    """Save/load for the Keras-backed models.
+
+    This is a mixin rather than an assignment such as ``save = LSTMModel.save``:
+    a classmethod accessed through another class is still bound to the class
+    that defined it, so ``CNN1DModel.load = LSTMModel.load`` would rebuild an
+    ``LSTMModel`` from a CNN checkpoint and then feed it sequence-shaped input.
+    Inheriting keeps ``cls`` pointing at the real class.
+    """
+
+    def save(self, path: str | os.PathLike) -> None:
+        path = Path(path)
+        ensure_dir(path.parent)
+        self.model.save(path.with_suffix(".keras"))
+        with open(path.with_suffix(".json"), "w", encoding="utf-8") as fh:
+            json.dump({"features": self.feature_names_,
+                       "seen_classes": [int(c) for c in self._seen],
+                       "model": self.name,
+                       "train_time_s": self.stats.train_time_s,
+                       "n_parameters": self.stats.n_parameters}, fh)
+
+    @classmethod
+    def load(cls, path: str | os.PathLike, cfg: Mapping[str, Any],
+             classes: Sequence[Any]) -> "BaseModel":
+        import tensorflow as tf
+
+        obj = cls(cfg, classes)
+        path = Path(path)
+        meta = json.loads(path.with_suffix(".json").read_text())
+        saved_as = meta.get("model")
+        if saved_as and saved_as != cls.name:
+            raise ValueError(
+                f"{path} holds a {saved_as!r} model but {cls.__name__} "
+                f"({cls.name!r}) was asked to load it")
+        obj.model = tf.keras.models.load_model(path.with_suffix(".keras"))
+        obj.feature_names_ = meta["features"]
+        obj._seen = np.array(meta.get("seen_classes", list(classes)))
+        obj.stats.train_time_s = meta.get("train_time_s", 0.0)
+        obj.stats.n_parameters = meta.get("n_parameters", 0)
+        return obj
+
+
 # ===========================================================================
 # LSTM (Stage 6.5)
 # ===========================================================================
-class LSTMModel(BaseModel):
+class LSTMModel(KerasModelIO, BaseModel):
     """Sequence model over windows of L consecutive flows of one session.
 
     Input is ``(L, k)`` -- up to ``L`` consecutive flows of the session ending
@@ -312,25 +355,33 @@ class LSTMModel(BaseModel):
         p = self.cfg["models"]["lstm"]
         L = int(p.get("window", 10))
         self.feature_names_ = list(X_tr.columns)
-        n_classes = len(self.classes)
 
         Xw, yw = build_session_windows(
             X_tr.to_numpy(dtype=np.float32), np.asarray(y_tr), session_ids, times, L)
-        y_idx = np.array([self._class_index.get(v, 0) for v in yw], dtype=np.int32)
+        # Output units cover only the classes actually present in training, so a
+        # class the model never saw receives exactly zero probability rather than
+        # a share of the softmax. _align then places them in the canonical order.
+        # This matters for branch E, where the held-out family is absent by
+        # design, and it makes the neural models behave like the tree models.
+        self._seen = np.unique(y_tr)
+        seen_index = {c: i for i, c in enumerate(self._seen)}
+        n_out = len(self._seen)
+        y_idx = np.array([seen_index.get(v, 0) for v in yw], dtype=np.int32)
 
         val_data = None
         if X_val is not None and y_val is not None:
             Xv, yv = build_session_windows(
                 X_val.to_numpy(dtype=np.float32), np.asarray(y_val),
                 val_session_ids, val_times, L)
-            if len(Xv):
-                val_data = (Xv, np.array([self._class_index.get(v, 0) for v in yv],
-                                         dtype=np.int32))
+            keep = np.isin(yv, self._seen)
+            if len(Xv) and keep.any():
+                val_data = (Xv[keep], np.array([seen_index[v] for v in yv[keep]],
+                                               dtype=np.int32))
 
-        self.model = self._build(X_tr.shape[1], n_classes)
-        weights = ({int(self._class_index[k]): float(v) for k, v in class_weights.items()
-                    if k in self._class_index} if class_weights
-                   else _keras_class_weight(y_idx, n_classes))
+        self.model = self._build(X_tr.shape[1], n_out)
+        weights = ({int(seen_index[k]): float(v) for k, v in class_weights.items()
+                    if k in seen_index} if class_weights
+                   else _keras_class_weight(y_idx, n_out))
         callbacks = []
         if val_data is not None:
             callbacks.append(tf.keras.callbacks.EarlyStopping(
@@ -356,39 +407,17 @@ class LSTMModel(BaseModel):
             X.to_numpy(dtype=np.float32), np.zeros(n, dtype=np.int64),
             session_ids, times, L, return_index=True)
         chunk = int(self.cfg["models"].get("predict_chunk_size", 200000))
-        out = np.full((n, len(self.classes)), 1.0 / len(self.classes), dtype=np.float64)
+        raw = np.full((n, len(self._seen)), 1.0 / len(self._seen), dtype=np.float64)
         with Timer("predict_lstm") as t:
             for a, b in chunked(len(Xw), chunk):
-                out[rows[a:b]] = self.model.predict(Xw[a:b], verbose=0)
-        return self._finish_predict(out / out.sum(axis=1, keepdims=True), n, t.elapsed)
-
-    def save(self, path):
-        path = Path(path)
-        ensure_dir(path.parent)
-        self.model.save(path.with_suffix(".keras"))
-        with open(path.with_suffix(".json"), "w", encoding="utf-8") as fh:
-            json.dump({"features": self.feature_names_,
-                       "train_time_s": self.stats.train_time_s,
-                       "n_parameters": self.stats.n_parameters}, fh)
-
-    @classmethod
-    def load(cls, path, cfg, classes):
-        import tensorflow as tf
-
-        obj = cls(cfg, classes)
-        path = Path(path)
-        obj.model = tf.keras.models.load_model(path.with_suffix(".keras"))
-        meta = json.loads(path.with_suffix(".json").read_text())
-        obj.feature_names_ = meta["features"]
-        obj.stats.train_time_s = meta.get("train_time_s", 0.0)
-        obj.stats.n_parameters = meta.get("n_parameters", 0)
-        return obj
+                raw[rows[a:b]] = self.model.predict(Xw[a:b], verbose=0)
+        return self._finish_predict(self._align(raw, list(self._seen)), n, t.elapsed)
 
 
 # ===========================================================================
 # 1-D CNN (Stage 6.6)
 # ===========================================================================
-class CNN1DModel(BaseModel):
+class CNN1DModel(KerasModelIO, BaseModel):
     """Exactly the Stage 6.6 architecture table.
 
     Conv1D(64, k=3, same) -> ReLU -> BatchNorm -> MaxPool(2) ->
@@ -444,20 +473,26 @@ class CNN1DModel(BaseModel):
 
         p = self.cfg["models"]["cnn"]
         self.feature_names_ = list(X_tr.columns)
-        n_classes = len(self.classes)
-        y_idx = np.array([self._class_index.get(v, 0) for v in np.asarray(y_tr)], dtype=np.int32)
+        # Output units cover only the classes present in training (see LSTMModel).
+        self._seen = np.unique(y_tr)
+        seen_index = {c: i for i, c in enumerate(self._seen)}
+        n_out = len(self._seen)
+        y_idx = np.array([seen_index.get(v, 0) for v in np.asarray(y_tr)], dtype=np.int32)
         Xa = X_tr.to_numpy(dtype=np.float32)[..., None]
 
         val_data = None
         if X_val is not None and y_val is not None and len(X_val):
-            val_data = (X_val[self.feature_names_].to_numpy(dtype=np.float32)[..., None],
-                        np.array([self._class_index.get(v, 0) for v in np.asarray(y_val)],
-                                 dtype=np.int32))
+            yv = np.asarray(y_val)
+            keep = np.isin(yv, self._seen)
+            if keep.any():
+                val_data = (X_val[self.feature_names_].to_numpy(
+                                dtype=np.float32)[keep][..., None],
+                            np.array([seen_index[v] for v in yv[keep]], dtype=np.int32))
 
-        self.model = self._build(X_tr.shape[1], n_classes)
-        weights = ({int(self._class_index[k]): float(v) for k, v in class_weights.items()
-                    if k in self._class_index} if class_weights
-                   else _keras_class_weight(y_idx, n_classes))
+        self.model = self._build(X_tr.shape[1], n_out)
+        weights = ({int(seen_index[k]): float(v) for k, v in class_weights.items()
+                    if k in seen_index} if class_weights
+                   else _keras_class_weight(y_idx, n_out))
         callbacks = []
         if val_data is not None:
             callbacks.append(tf.keras.callbacks.EarlyStopping(
@@ -484,12 +519,8 @@ class CNN1DModel(BaseModel):
             for a, b in chunked(len(X), chunk):
                 arr = X.iloc[a:b].to_numpy(dtype=np.float32)[..., None]
                 parts.append(self.model.predict(arr, verbose=0))
-        proba = np.vstack(parts).astype(np.float64)
-        proba = proba / proba.sum(axis=1, keepdims=True)
+        proba = self._align(np.vstack(parts).astype(np.float64), list(self._seen))
         return self._finish_predict(proba, len(X), t.elapsed)
-
-    save = LSTMModel.save
-    load = LSTMModel.load
 
 
 # ===========================================================================
@@ -686,12 +717,16 @@ class GNNModel(BaseModel):
         graph = build_session_graph(session_ids, times, hosts,
                                     X_tr.to_numpy(dtype=np.float32), np.asarray(y_tr),
                                     self.cfg)
-        self.model = self._build(X_tr.shape[1], len(self.classes))
+        # Output units cover only the classes present among the NODE labels
+        # (see LSTMModel); _align places them in the canonical order.
+        self._seen = np.unique(graph["y"])
+        seen_index = {c: i for i, c in enumerate(self._seen)}
+        self.model = self._build(X_tr.shape[1], len(self._seen))
 
         x = torch.tensor(graph["x"], dtype=torch.float32)
         ei = torch.tensor(graph["edge_index"], dtype=torch.long)
         adj = self._normalised_adj(graph["edge_index"], graph["n_nodes"])
-        y_node = torch.tensor([self._class_index.get(v, 0) for v in graph["y"]],
+        y_node = torch.tensor([seen_index.get(v, 0) for v in graph["y"]],
                               dtype=torch.long)
 
         # Class weights must be computed at the granularity of the LOSS. This
@@ -701,7 +736,7 @@ class GNNModel(BaseModel):
         # rare classes). So when weighting is requested, re-derive w_c =
         # N_nodes/(C*N_c_nodes) from the node labels.
         if class_weights:
-            counts = torch.bincount(y_node, minlength=len(self.classes)).double()
+            counts = torch.bincount(y_node, minlength=len(self._seen)).double()
             present = max(int((counts > 0).sum()), 1)
             w = torch.tensor(
                 [(len(y_node) / (present * c) if c > 0 else 0.0) for c in counts],
@@ -745,8 +780,7 @@ class GNNModel(BaseModel):
                 logits = self.model(x, ei, adj)
             node_proba = torch.softmax(logits, dim=-1).numpy().astype(np.float64)
         # Broadcast each session node's distribution to its flows.
-        proba = node_proba[graph["row_to_node"]]
-        proba = proba / proba.sum(axis=1, keepdims=True)
+        proba = self._align(node_proba[graph["row_to_node"]], list(self._seen))
         return self._finish_predict(proba, len(X), t.elapsed)
 
     def save(self, path):
@@ -757,6 +791,7 @@ class GNNModel(BaseModel):
         torch.save({"state_dict": self.model.state_dict(),
                     "features": self.feature_names_,
                     "n_features": len(self.feature_names_),
+                    "seen_classes": [int(c) for c in self._seen],
                     "use_pyg": self.use_pyg,
                     "stats_extra": self.stats.extra}, path.with_suffix(".pt"))
 
@@ -767,7 +802,8 @@ class GNNModel(BaseModel):
         obj = cls(cfg, classes)
         blob = torch.load(Path(path).with_suffix(".pt"), weights_only=False)
         obj.feature_names_ = blob["features"]
-        obj.model = obj._build(blob["n_features"], len(classes))
+        obj._seen = np.array(blob.get("seen_classes", list(classes)))
+        obj.model = obj._build(blob["n_features"], len(obj._seen))
         obj.model.load_state_dict(blob["state_dict"])
         obj.stats.extra = blob.get("stats_extra", {})
         return obj

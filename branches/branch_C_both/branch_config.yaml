@@ -1,0 +1,9 @@
+# Branch C -- SMOTE-ENN AND class weighting, time-blocked split.
+# This is the MAIN experiment; the root config.yaml already defaults to it.
+run:
+  name: "branch_C_both"
+  output_dir: "branches/branch_C_both/results"
+imbalance:
+  mode: "both"
+split:
+  strategy: "time_blocked"

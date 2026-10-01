@@ -1,0 +1,10 @@
+# Branch D -- stratified splits, to quantify the leakage gap.
+# The runner executes BOTH stratified variants and compares them with the
+# time-blocked result of branch C.
+run:
+  name: "branch_D_stratified_split"
+  output_dir: "branches/branch_D_stratified_split/results"
+imbalance:
+  mode: "both"
+split:
+  strategy: "stratified_session"

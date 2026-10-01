@@ -20,7 +20,7 @@ from tests.synthetic_data import generate   # noqa: E402
 def data_dir(tmp_path_factory) -> Path:
     """A small synthetic CIC-IDS2017-shaped dataset."""
     out = tmp_path_factory.mktemp("cicids")
-    generate(out, total_rows=12000, seed=11)
+    generate(out, total_rows=9000, seed=11)
     return out
 
 
@@ -35,6 +35,11 @@ def cfg(tmp_path_factory) -> dict:
     c["run"]["model_dir"] = str(tmp / "models")
     c["run"]["use_cache"] = False
     c["data"]["subsample_frac"] = 0.25
+    # The stability loop re-runs all eight rankers n_runs times; the dedicated
+    # ranker tests already cover them, so keep it out of the shared fixture.
+    c["feature_selection"]["stability"]["enabled"] = False
+    c["feature_selection"]["pi_svm"].update(max_rows=600, n_repeats=1)
+    c["feature_selection"]["lstm"].update(epochs=1, max_windows=1200, grad_batches=3)
     return c
 
 

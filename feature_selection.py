@@ -740,3 +740,214 @@ def _save_artifacts(res: FeatureSelectionResult, cfg: Mapping[str, Any],
             for m, s in res.ranker_scores.items()},
         "timings_s": res.timings,
     }, out_dir / f"feature_selection{suffix}.json")
+
+
+# ===========================================================================
+# Stage 8.2 ablations and Stage 8.3 sensitivity grids
+# ===========================================================================
+def _equal_size_baseline(name: str, X: pd.DataFrame, y: np.ndarray, size: int,
+                         cfg: Mapping[str, Any], seed: int) -> List[str]:
+    """PCC / IG / PCA selectors at the same subset size as F* (Stage 8.2 exp. 9)."""
+    from sklearn.decomposition import PCA
+    from sklearn.feature_selection import mutual_info_classif
+
+    cols = list(X.columns)
+    if name == "pcc":
+        # |Pearson| against the one-vs-rest indicator, maxed over classes.
+        arr = X.to_numpy(dtype=np.float64)
+        best = np.zeros(arr.shape[1])
+        for c in np.unique(y):
+            target = (y == c).astype(np.float64)
+            if target.std() == 0:
+                continue
+            centred = arr - arr.mean(axis=0)
+            denom = arr.std(axis=0) * target.std() * len(target)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                r = np.abs((centred * (target - target.mean())[:, None]).sum(axis=0) / denom)
+            best = np.maximum(best, np.nan_to_num(r))
+        order = np.argsort(-best)
+    elif name == "ig":
+        # Information gain == mutual information with a discrete estimator.
+        idx = stratified_subsample(y, 20000, seed, min_per_class=5)
+        scores = mutual_info_classif(X.iloc[idx], y[idx], discrete_features=False,
+                                     random_state=seed)
+        order = np.argsort(-scores)
+    elif name == "pca":
+        # PCA is a projection, not a selector; the comparable subset is the
+        # features with the largest loadings on the leading components.
+        n_comp = min(size, X.shape[1], len(X))
+        pca = PCA(n_components=n_comp, random_state=seed).fit(X.to_numpy(dtype=np.float64))
+        loading = np.abs(pca.components_).T @ pca.explained_variance_ratio_
+        order = np.argsort(-loading)
+    else:
+        raise ValueError(f"unknown equal-size baseline {name!r}")
+    return [cols[i] for i in order[:size]]
+
+
+def run_feature_ablations(X_train: pd.DataFrame, y_train: np.ndarray,
+                          X_val: pd.DataFrame, y_val: np.ndarray,
+                          result: FeatureSelectionResult, cfg: Mapping[str, Any],
+                          seed: int = 42, out_dir: Optional[str] = None,
+                          X_test: Optional[pd.DataFrame] = None,
+                          y_test: Optional[np.ndarray] = None) -> pd.DataFrame:
+    """Stage 8.2 feature-selection ablations, every subset matched in size to F*.
+
+    Each experiment is scored with the same class-balanced LightGBM probe used
+    for N*, so the only thing that varies is which features it receives.
+    """
+    import lightgbm as lgb
+    from sklearn.metrics import f1_score, recall_score
+
+    fs = cfg["feature_selection"]
+    experiments = fs["ablation"].get("experiments", [])
+    size = len(result.f_star)
+    probe = fs["n_star_probe"]
+    Xc_train = X_train[result.f_corr]
+    Xc_val = X_val[result.f_corr]
+    Xc_test = X_test[result.f_corr] if X_test is not None else None
+    k = int(fs["top_k"])
+
+    def subsets() -> Dict[str, List[str]]:
+        sets: Dict[str, List[str]] = {}
+        scores = result.ranker_scores
+        feats = result.f_corr
+        votes = result.votes_table
+
+        for exp in experiments:
+            if exp == "all_features":
+                sets["1. all features"] = list(feats)
+            elif exp == "mi_only" and "mi" in scores:
+                sets["2. MI only"] = topk_set(scores["mi"], feats, size)
+            elif exp == "rfi_xgb":
+                combo = {m: scores[m] for m in ("rfi", "xgb") if m in scores}
+                if combo:
+                    tbl = fuse_rankings(combo, feats, k, 1)
+                    sets["3. RFI + XGB"] = tbl["feature"].tolist()[:size]
+            elif exp == "sd_dmm_mi":
+                combo = {m: scores[m] for m in ("sd", "dmm", "mi") if m in scores}
+                if combo:
+                    tbl = fuse_rankings(combo, feats, k, 1)
+                    sets["4. SD + DMM + MI"] = tbl["feature"].tolist()[:size]
+            elif exp == "pi_svm_only" and "pi_svm" in scores:
+                sets["5. PI-SVM only"] = topk_set(scores["pi_svm"], feats, size)
+            elif exp == "vote_only" and len(votes):
+                # Frequency vote WITHOUT rank aggregation: order by psi alone.
+                pool = votes[votes["in_pool"] == 1].sort_values(
+                    "psi_votes", ascending=False)
+                sets["6. vote only (psi >= eta)"] = pool["feature"].tolist()[:size]
+            elif exp == "vote_rank":
+                sets["7. vote + rank (proposed F*)"] = list(result.f_star)
+            elif exp == "leave_one_ranker_out":
+                for drop in scores:
+                    rest = {m: s for m, s in scores.items() if m != drop}
+                    tbl = fuse_rankings(rest, feats, k, max(1, int(fs["vote_threshold"]) - 1))
+                    pool = tbl[tbl["in_pool"] == 1]["feature"].tolist() or tbl["feature"].tolist()
+                    sets[f"8. leave-one-out: no {drop}"] = pool[:size]
+            elif exp == "base_paper_six":
+                six = {m: s for m, s in scores.items()
+                       if m in ("mi", "rfi", "pi_svm", "shap_lgbm", "dmm", "sd")}
+                if six:
+                    tbl = fuse_rankings(six, feats, k, 4)
+                    pool = tbl[tbl["in_pool"] == 1]["feature"].tolist() or tbl["feature"].tolist()
+                    sets["9. base-paper 6 rankers"] = pool[:size]
+            elif exp in ("pcc_equal_size", "ig_equal_size", "pca_equal_size"):
+                which = exp.split("_")[0]
+                try:
+                    sets[f"9. {which.upper()} (equal size)"] = _equal_size_baseline(
+                        which, Xc_train, y_train, size, cfg, seed)
+                except Exception as exc:
+                    LOGGER.warning("ablation %s failed: %s", exp, exc)
+        return sets
+
+    rows: List[Dict[str, Any]] = []
+    all_sets = subsets()
+    for label, feats_i in progress(list(all_sets.items()), desc="FS ablations",
+                                   total=len(all_sets)):
+        if not feats_i:
+            continue
+        tr_idx = stratified_subsample(
+            y_train, int(probe.get("max_train_rows", 200000)), seed, min_per_class=5)
+        model = lgb.LGBMClassifier(
+            n_estimators=int(probe.get("n_estimators", 150)),
+            learning_rate=float(probe.get("learning_rate", 0.1)),
+            num_leaves=int(probe.get("num_leaves", 31)),
+            class_weight=probe.get("class_weight", "balanced"),
+            random_state=seed, n_jobs=-1, verbose=-1,
+        ).fit(Xc_train.iloc[tr_idx][feats_i], y_train[tr_idx])
+
+        def score_on(X, y):
+            if X is None or y is None:
+                return {}
+            pred = model.predict(X[feats_i])
+            minority = [c for c in np.unique(y_train)
+                        if (y_train == c).sum() < 0.05 * len(y_train)]
+            return {
+                "macro_f1": f1_score(y, pred, average="macro", zero_division=0),
+                "weighted_f1": f1_score(y, pred, average="weighted", zero_division=0),
+                "minority_recall": (recall_score(y, pred, labels=minority,
+                                                 average="macro", zero_division=0)
+                                    if minority else float("nan")),
+            }
+
+        row: Dict[str, Any] = {"experiment": label, "n_features": len(feats_i)}
+        row.update({f"val_{k2}": v for k2, v in score_on(Xc_val, y_val).items()})
+        row.update({f"test_{k2}": v for k2, v in score_on(Xc_test, y_test).items()})
+        row["features"] = ", ".join(feats_i[:10]) + ("..." if len(feats_i) > 10 else "")
+        rows.append(row)
+
+    table = pd.DataFrame(rows)
+    if len(table):
+        table = table.sort_values("val_macro_f1", ascending=False).reset_index(drop=True)
+        if out_dir:
+            save_table(table, Path(out_dir) / "feature_selection_ablations.csv")
+    LOGGER.info("Stage 8.2: ran %d feature-selection ablation(s)", len(table))
+    return table
+
+
+def run_sensitivity(X_train: pd.DataFrame, y_train: np.ndarray,
+                    X_val: pd.DataFrame, y_val: np.ndarray,
+                    result: FeatureSelectionResult, cfg: Mapping[str, Any],
+                    seed: int = 42, out_dir: Optional[str] = None) -> pd.DataFrame:
+    """Stage 8.3 sensitivity grids over N, the vote threshold eta and the list size K."""
+    import lightgbm as lgb
+    from sklearn.metrics import f1_score
+
+    fs = cfg["feature_selection"]
+    sens = fs["sensitivity"]
+    probe = fs["n_star_probe"]
+    Xc_train, Xc_val = X_train[result.f_corr], X_val[result.f_corr]
+    rows: List[Dict[str, Any]] = []
+
+    def evaluate(feats: Sequence[str]) -> float:
+        if not feats:
+            return float("nan")
+        idx = stratified_subsample(y_train, int(probe.get("max_train_rows", 200000)),
+                                   seed, min_per_class=5)
+        m = lgb.LGBMClassifier(
+            n_estimators=int(probe.get("n_estimators", 150)),
+            learning_rate=float(probe.get("learning_rate", 0.1)),
+            class_weight="balanced", random_state=seed, n_jobs=-1, verbose=-1,
+        ).fit(Xc_train.iloc[idx][list(feats)], y_train[idx])
+        return float(f1_score(y_val, m.predict(Xc_val[list(feats)]),
+                              average="macro", zero_division=0))
+
+    combos = [(k, eta, n)
+              for k in sens.get("k_values", [fs["top_k"]])
+              for eta in sens.get("eta_values", [fs["vote_threshold"]])
+              for n in sens.get("n_values", fs["n_grid"])]
+    for k, eta, n in progress(combos, desc="sensitivity", total=len(combos)):
+        tbl = fuse_rankings(result.ranker_scores, result.f_corr, int(k), int(eta))
+        pool = tbl[tbl["in_pool"] == 1]["feature"].tolist()
+        if len(pool) < n:
+            rows.append({"K": k, "eta": eta, "N": n, "pool_size": len(pool),
+                         "val_macro_f1": float("nan"),
+                         "note": "pool smaller than N"})
+            continue
+        rows.append({"K": k, "eta": eta, "N": n, "pool_size": len(pool),
+                     "val_macro_f1": evaluate(pool[:n]), "note": ""})
+
+    table = pd.DataFrame(rows)
+    if out_dir and len(table):
+        save_table(table, Path(out_dir) / "feature_selection_sensitivity.csv")
+    LOGGER.info("Stage 8.3: evaluated %d (K, eta, N) combination(s)", len(table))
+    return table

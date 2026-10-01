@@ -170,6 +170,17 @@ def run_pipeline(
     F_va = fs_result.apply(X_va, "validation")
     F_te = fs_result.apply(X_te, "test")
 
+    # Stage 8.2 ablations / 8.3 sensitivity (config flags; off by default).
+    if cfg["feature_selection"].get("ablation", {}).get("enabled", False):
+        with Timer("stage_8_2_fs_ablations", timings, LOGGER):
+            fsel.run_feature_ablations(X_tr, y_tr, X_va, y_va, fs_result, cfg,
+                                       seed, out_dir=str(out_dir),
+                                       X_test=X_te, y_test=y_te)
+    if cfg["feature_selection"].get("sensitivity", {}).get("enabled", False):
+        with Timer("stage_8_3_fs_sensitivity", timings, LOGGER):
+            fsel.run_sensitivity(X_tr, y_tr, X_va, y_va, fs_result, cfg, seed,
+                                 out_dir=str(out_dir))
+
     if make_plots and len(fs_result.votes_table):
         ev.plot_feature_votes(fs_result.votes_table, cfg, out_dir / "feature_votes_heatmap.png")
         ev.plot_rank_scores(fs_result.votes_table, cfg, out_dir / "feature_rank_scores.png")
