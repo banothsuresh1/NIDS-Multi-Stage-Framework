@@ -218,8 +218,22 @@ def generate(out_dir: str | Path, total_rows: int = 60000, seed: int = 7,
     if include_identifiers:
         # A small host population so that the symmetric communication key
         # recurs often enough to form multi-flow sessions, as in the real capture.
+        # Attacks are launched from a FEW dedicated hosts rather than spread
+        # uniformly, as in the real capture (one attacker runs the port scan,
+        # one box is the bot, and so on). Without this host affinity the
+        # communication graph carries no class signal at all and the GNN has
+        # nothing to learn from structure.
         src = np.array([f"192.168.10.{i}" for i in rng.integers(1, n_hosts + 1, n)])
         dst = np.array([f"172.16.0.{i}" for i in rng.integers(1, n_servers + 1, n)])
+        labels_arr = data["Label"].to_numpy()
+        attacker_of = {}
+        for k, lab in enumerate(sorted(set(labels_arr) - {"BENIGN"})):
+            attacker_of[lab] = f"192.168.10.{(n_hosts + 1 + k)}"
+        for lab, host in attacker_of.items():
+            mask = labels_arr == lab
+            # 85% of a family's flows come from its own attacker host.
+            own = mask & (rng.random(n) < 0.85)
+            src[own] = host
         data.insert(0, "Flow ID", [f"F{i:08d}" for i in range(n)])
         data.insert(1, "Source IP", src)
         data.insert(2, "Source Port", rng.integers(1024, 65535, n))

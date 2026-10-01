@@ -280,6 +280,17 @@ imbalance:
   # none | class_weight | smote_enn | both   (root default = both => branch C)
   mode: "both"
   class_weight_formula: "balanced"   # w_c = N / (C * N_c)
+  # Whether the RESAMPLED training set is also fed to the sequence/graph models
+  # (LSTM, GNN). Default false: a SMOTE sample is an interpolated point with no
+  # session membership, no timestamp and no host, so it cannot take part in a
+  # flow window or carry a graph edge. Those two models therefore train on the
+  # original ordered training flows with class weighting only, while RF, XGBoost
+  # and the CNN train on the resampled set. Setting this true attaches each
+  # synthetic row to a singleton session, which makes the LSTM window a single
+  # padded flow and the GNN node isolated -- documented, but not recommended.
+  # See README "Deviations / Assumptions".
+  apply_to_sequence_models: false
+  sequence_models: ["lstm", "gnn"]
   smote_enn:
     k_neighbors: 5                   # effective k = min(k_neighbors, n_c - 1)
     # Classes with fewer than this many TRAIN samples cannot support SMOTE
@@ -291,6 +302,19 @@ imbalance:
     # null = no cap.
     majority_cap: 300000
     enn_n_neighbors: 3
+    # Oversampling target per class.
+    #   "full"   -- imblearn's default: every class is raised to the majority
+    #               count. This is the literal reading of "SMOTE", but on
+    #               CIC-IDS2017 it manufactures ~2.27M synthetic Heartbleed rows
+    #               from 11 real ones; the deep models then fit those synthetic
+    #               clusters and collapse (observed: train acc 0.69, val 0.10).
+    #   "capped" -- (DEFAULT) a class is raised to at most
+    #               max_oversample_ratio x its real count, and never above the
+    #               majority. Residual imbalance is handled by class weighting,
+    #               which is exactly why branch C combines the two.
+    # See README "Deviations / Assumptions".
+    target_strategy: "capped"
+    max_oversample_ratio: 20
     sampling_strategy: "auto"
     # ENN can delete every sample of a rare class; restore them if it does.
     protect_rare_classes: true
@@ -332,6 +356,13 @@ models:
     conv1_filters: 64
     conv1_kernel: 3
     conv1_padding: "same"
+    # BatchNorm momentum for the moving mean/variance used at INFERENCE time.
+    # Keras defaults to 0.99, which needs thousands of updates to converge; with
+    # a short schedule the moving averages are still near their initialisation
+    # while the batch statistics used during training are not, so the network
+    # scores well on train and collapses on val/test. 0.9 adapts fast enough for
+    # the epoch budgets here. See README "Deviations / Assumptions".
+    batchnorm_momentum: 0.9
     pool1: 2
     conv2_filters: 128
     conv2_kernel: 3
@@ -350,11 +381,26 @@ models:
     hidden_dim: 64
     num_layers: 2
     dropout: 0.3
-    epochs: 30
+    # Full-batch GCN: an epoch is one gradient step, so this is far larger than
+    # the mini-batch epoch counts of the LSTM/CNN.
+    epochs: 300
     learning_rate: 0.01
     weight_decay: 5.0e-4
     # Time-causal edge budget per node (most recent predecessors).
     max_in_degree: 10
+    # An edge is kept only if the two sessions start within this many seconds of
+    # each other. Multi-stage attack activity is bursty, so time locality is
+    # what makes a shared host informative; without it a workstation's whole
+    # week of traffic becomes one clique. null disables the constraint.
+    edge_max_time_gap_s: 900
+    # Linear skip from the raw node features to the output logits. A GCN layer
+    # averages over neighbours, which destroys a node's own signal when the
+    # graph has low homophily (measured on this data: edges join same-class
+    # sessions barely more often than chance). The skip keeps the node's own
+    # evidence available, so the GNN degrades to a per-session classifier when
+    # the graph is uninformative and improves on it when it is not.
+    # See README "Deviations / Assumptions".
+    residual: true
     # Cap edges per split to bound memory.
     max_edges: 2000000
     batch_size: 4096
@@ -504,9 +550,12 @@ smoke:
   models:
     rf: {n_estimators: 50}
     xgb: {n_estimators: 60, early_stopping_rounds: 10}
-    lstm: {epochs: 2, patience: 1}
-    cnn: {epochs: 2, patience: 1}
-    gnn: {epochs: 5, max_edges: 200000}
+    # Smoke mode has ~100x fewer gradient steps per epoch than the full run, so
+    # the neural models need a larger epoch budget and a higher learning rate
+    # here to reach the same place, not a smaller one.
+    lstm: {epochs: 40, batch_size: 128, learning_rate: 0.003, patience: 8}
+    cnn: {epochs: 30, batch_size: 128, patience: 8}
+    gnn: {epochs: 200, max_edges: 200000}
     predict_chunk_size: 50000
   temporal:
     fp_growth: {min_support: 0.05}
