@@ -179,23 +179,38 @@ def main() -> int:
 
 
 def print_checklist(out_dir: Path) -> None:
-    """Stage -> file -> status table (Definition of Done item 4)."""
+    """Stage -> file -> status table (Definition of Done item 4).
+
+    Artifacts carry the run tag in their name (``metrics_root.csv``), so each
+    entry is a glob rather than an exact filename.
+    """
     checks = [
-        ("Stage 1: dataset consolidation", "data_preprocessing.py", out_dir / "class_distribution.csv"),
-        ("Stage 2: preprocessing", "data_preprocessing.py", out_dir / "preprocessing_report.json"),
-        ("Stage 3: splits", "data_preprocessing.py", out_dir / "split_distribution.csv"),
-        ("Stage 4: feature selection", "feature_selection.py", out_dir / "feature_votes.csv"),
-        ("Stage 5: imbalance handling", "imbalance_handling.py", out_dir / "imbalance_report.csv"),
-        ("Stage 6: models", "models.py", out_dir / "model_efficiency.csv"),
-        ("Stage 7: evidence fusion", "fusion.py", out_dir / "fusion_weights.csv"),
-        ("Stage 8: evaluation", "evaluation.py", out_dir / "metrics.csv"),
-        ("Stage 9: temporal mining", "temporal_pattern_mining.py", out_dir / "attack_state_graph.json"),
-        ("Branches A-E", "branches/*/run.py", out_dir / "branch_comparison.csv"),
+        ("Stage 1: dataset consolidation", "data_preprocessing.py", "class_distribution.csv"),
+        ("Stage 2: preprocessing", "data_preprocessing.py", "preprocessing_report.json"),
+        ("Stage 3: splits", "data_preprocessing.py", "split_distribution.csv"),
+        ("Stage 4: feature selection", "feature_selection.py", "feature_votes*.csv"),
+        ("Stage 4: N* on validation", "feature_selection.py", "n_star_curve*.csv"),
+        ("Stage 5: imbalance handling", "imbalance_handling.py", "imbalance_report.csv"),
+        ("Stage 6: models", "models.py", "model_efficiency*.csv"),
+        ("Stage 7: calibration + fusion", "fusion.py", "fusion_weights*.csv"),
+        ("Stage 7.6: fusion ablations", "fusion.py", "fusion_ablations.csv"),
+        ("Stage 8: evaluation", "evaluation.py", "metrics*.csv"),
+        ("Stage 8: confusion matrices", "evaluation.py", "confusion_*.png"),
+        ("Stage 8: ROC / PR curves", "evaluation.py", "roc_curves*.png"),
+        ("Stage 8: significance tests", "evaluation.py", "significance*.csv"),
+        ("Stage 9: mined patterns", "temporal_pattern_mining.py", "prefixspan_patterns*.csv"),
+        ("Stage 9: attack-state graph", "temporal_pattern_mining.py", "attack_state_graph*.json"),
+        ("Branches A-E comparison", "branches/*/run.py", "branch_comparison.csv"),
     ]
-    rows = [(stage, file, "OK" if Path(art).exists() else "MISSING")
-            for stage, file, art in checks]
+    rows = []
+    for stage, file, pattern in checks:
+        hits = sorted(out_dir.glob(pattern))
+        rows.append((stage, file, f"OK ({len(hits)})" if hits else "MISSING"))
     print("\n================ STAGE CHECKLIST ================")
     print(utils.format_checklist(rows))
+    missing = [r[0] for r in rows if r[2] == "MISSING"]
+    if missing:
+        print(f"\nNot produced by this run: {', '.join(missing)}")
 
 
 if __name__ == "__main__":

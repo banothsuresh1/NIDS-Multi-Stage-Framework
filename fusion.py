@@ -528,25 +528,58 @@ def run_fusion_ablations(fusion: EvidenceFusion, proba: Mapping[str, np.ndarray]
 
 
 def worked_example(fw: FusionWeights, fusion: EvidenceFusion, row: int = 0,
+                   proba: Optional[Mapping[str, np.ndarray]] = None,
+                   sp: Optional[np.ndarray] = None, tc: Optional[np.ndarray] = None,
                    class_names: Optional[Mapping[Any, str]] = None) -> pd.DataFrame:
-    """Reproduce the Stage 7.4 per-source table for one session."""
+    """Reproduce the Stage 7.4 per-source table for one session.
+
+    Columns mirror the document's example (baseline Q, confidence C, context K,
+    reliability q, weight w, score, w x score) and the ``w x score`` column sums
+    to the row's fused risk ``R_t``. The document's own numbers there are
+    illustrative; these are the real fitted values.
+
+    ``proba`` is the calibrated probability dict the fusion was given, and
+    ``sp``/``tc`` the temporal evidence, so the per-source scores can be shown;
+    without them only the weights are reported.
+    """
     benign = fusion._benign_class()
-    rows = []
+    rows: List[Dict[str, Any]] = []
+    total_contrib = 0.0
+
     for j, src in enumerate(fw.sources):
         entry: Dict[str, Any] = {
             "source": src,
-            "baseline_Q": round(fw.Q.get(src, float("nan")), 4),
-            "reliability_q": round(float(fw.reliabilities[row, j]), 4),
+            "baseline_Q": round(float(fw.Q.get(src, float("nan"))), 4),
             "weight_w": round(float(fw.weights[row, j]), 4),
+            "reliability_q": round(float(fw.reliabilities[row, j]), 4),
         }
-        entry["score"] = round(float(fw.risk[row]), 4) if src in ("sp", "tc") else None
-        entry["w_x_score"] = None
+        score: Optional[float] = None
+        if proba is not None and src in proba:
+            p = proba[src]
+            entry["confidence_C"] = round(float(confidence_term(p)[row]), 4)
+            score = float(1.0 - p[row, benign])          # attack evidence
+        elif src == "sp" and sp is not None:
+            score = float(sp[row])
+        elif src == "tc" and tc is not None:
+            score = float(tc[row])
+
+        if score is not None:
+            contrib = float(fw.weights[row, j]) * score
+            total_contrib += contrib
+            entry["score"] = round(score, 4)
+            entry["w_x_score"] = round(contrib, 4)
         rows.append(entry)
+
     out = pd.DataFrame(rows)
-    out.loc[len(out)] = {"source": "TOTAL", "baseline_Q": None,
-                         "reliability_q": round(float(fw.reliabilities[row].sum()), 4),
-                         "weight_w": round(float(fw.weights[row].sum()), 4),
-                         "score": None, "w_x_score": round(float(fw.risk[row]), 4)}
+    out.loc[len(out)] = {
+        "source": "TOTAL",
+        "baseline_Q": None,
+        "weight_w": round(float(fw.weights[row].sum()), 4),
+        "reliability_q": round(float(fw.reliabilities[row].sum()), 4),
+        "score": None,
+        "w_x_score": round(total_contrib if proba is not None
+                           else float(fw.risk[row]), 4),
+    }
     return out
 
 

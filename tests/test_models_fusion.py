@@ -283,3 +283,20 @@ def test_sp_is_in_unit_interval(cfg):
     assert np.all((sp >= 0) & (sp <= 1))
     assert sp[0] == pytest.approx(1.0)      # matches the strongest pattern
     assert sp[2] == 0.0                     # matches nothing
+
+
+def test_worked_example_reproduces_the_risk_score(fusion_setup):
+    """The w x score column must sum to R_t (methodology section 7.4)."""
+    cfg, classes, y, proba, n = fusion_setup
+    cfg = utils.deep_merge(cfg, {"fusion": {"tune_lambdas": {"enabled": False}}})
+    sp, tc = np.random.default_rng(2).random(n), np.random.default_rng(3).random(n)
+    avail = np.ones(n)
+    f = fus.EvidenceFusion(cfg=cfg, classes=classes, use_temporal=True)
+    f.fit(proba, y, sp=sp, tc=tc, availability=avail)
+    fw = f.fuse(proba, sp=sp, tc=tc, availability=avail)
+
+    table = fus.worked_example(fw, f, row=0, proba=proba, sp=sp, tc=tc)
+    total = table.loc[table["source"] == "TOTAL", "w_x_score"].iloc[0]
+    assert total == pytest.approx(float(fw.risk[0]), abs=1e-3)
+    # Weights in the table sum to 1.
+    assert table.loc[table["source"] == "TOTAL", "weight_w"].iloc[0] == pytest.approx(1.0, abs=1e-3)

@@ -363,10 +363,11 @@ writes in approximately flow-start order) and a **surrogate session key** of
 `TrafficLabelling` release to avoid both surrogates.
 
 **D5 — The session key makes singleton sessions.** Equation (22) is
-`{IP_min, IP_max, Port_min, Port_max, Protocol}`. On CIC-IDS2017 the client port
-is *ephemeral and unique per flow*, so this key yields ≈1 flow per session
-(measured: 39,994 sessions for 39,995 flows), which makes the LSTM windows, the
-GNN graph and the Stage 9 sequences degenerate. Default is
+`{IP_min, IP_max, Port_min, Port_max, Protocol}`. In CIC-IDS2017 the client port
+is *ephemeral and effectively unique per flow*, so including it makes the key
+almost a row identifier: on the synthetic fixture it produced 39,994 sessions
+for 39,995 flows, which leaves the LSTM windows, the GNN graph and the Stage 9
+sequences degenerate. Default is
 `preprocessing.session_key_mode: service_port` — `{IP_min, IP_max, Port_min,
 Protocol}`, i.e. eq. 22 **with the ephemeral high port dropped and the service
 port kept**. Set it to `five_tuple` for eq. 22 verbatim (the code warns when
