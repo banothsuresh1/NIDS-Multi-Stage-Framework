@@ -1,0 +1,10 @@
+# Branch A -- class weighting only (no resampling), time-blocked split.
+# Overrides ONLY what differs from the root config.yaml; everything else is
+# inherited by deep merge.
+run:
+  name: "branch_A_class_weighting"
+  output_dir: "branches/branch_A_class_weighting/results"
+imbalance:
+  mode: "class_weight"
+split:
+  strategy: "time_blocked"

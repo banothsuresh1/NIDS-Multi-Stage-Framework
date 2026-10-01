@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+data/interim/
+data/synthetic/
+data/MachineLearningCVE/
+results/
+branches/*/results/
+*.parquet
+*.joblib
+*.keras
+*.pt

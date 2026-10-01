@@ -1,0 +1,566 @@
+# =============================================================================
+# Flow-Aware Temporal Pattern Mining for Multi-Stage NIDS on CIC-IDS2017
+# Root configuration. EVERY hyperparameter lives here -- no hard-coded values
+# in the modules. Branch configs under branches/*/branch_config.yaml override
+# only the keys that differ (deep-merged onto this file).
+# Stage numbers refer to Methodology_NIDS_.docx.
+# =============================================================================
+
+run:
+  name: "root_branch_C_both"
+  # smoke_test subsamples the data and shrinks every expensive knob so the whole
+  # pipeline (incl. all 5 branches) finishes in minutes. See `smoke` block below.
+  smoke_test: true
+  output_dir: "results"
+  interim_dir: "data/interim"
+  cache_dir: "data/interim/cache"
+  model_dir: "data/interim/models"
+  log_level: "INFO"
+  # Resume from cached artifacts (cleaned parquet, ranker scores, trained models)
+  use_cache: true
+  # Matplotlib figure dpi (Stage 8 requires >= 200)
+  figure_dpi: 220
+
+seed:
+  # Primary seed used for every library (numpy, random, sklearn, torch, tf, xgb, lgbm)
+  primary: 42
+  # Multi-seed runs for mean +/- std reporting (Stage 8.3). Set to [42] for speed.
+  multi_seed: [42, 1337, 2024]
+  enable_multi_seed: false
+
+# -----------------------------------------------------------------------------
+# STAGE 1-2: dataset + preprocessing
+# -----------------------------------------------------------------------------
+data:
+  # Overridden by --data_dir on the CLI.
+  data_dir: "data/MachineLearningCVE"
+  csv_glob: "*.csv"
+  # Columns that are identifiers/time: excluded from X, used only for ordering,
+  # session grouping and graph construction (Stage 1.4 / 8.4).
+  identifier_columns:
+    - "Flow ID"
+    - "Source IP"
+    - "Destination IP"
+    - "Src IP"
+    - "Dst IP"
+    - "Timestamp"
+    - "Source Port"
+    - "Src Port"
+  # Destination Port can act as a shortcut on CIC-IDS2017 (Stage 8.4).
+  # Reported both ways; flip this flag for the ablation.
+  use_dst_port: false
+  dst_port_columns: ["Destination Port", "Dst Port"]
+  # Protocol handling: "numeric" keeps the integer code as a feature,
+  # "onehot" one-hot encodes it (fitted on train; unseen -> all zeros).
+  protocol_column: "Protocol"
+  protocol_encoding: "onehot"
+  label_column: "Label"
+  # Features where a negative value is a documented sentinel and must NOT be
+  # treated as invalid (Stage 2.3). CICFlowMeter emits -1 for "not observed".
+  negative_sentinel_features:
+    - "Init_Win_bytes_forward"
+    - "Init_Win_bytes_backward"
+    - "Init Fwd Win Bytes"
+    - "Init Bwd Win Bytes"
+  negative_sentinel_value: -1
+  # Non-sentinel negative values in otherwise non-negative features -> NaN.
+  negatives_to_nan: true
+  drop_exact_duplicates: true
+  inf_to_nan: true
+  # CSV timestamps are 12-hour without AM/PM; afternoon files are shifted by
+  # +12h when their parsed hour is < this bound (Stage 3.2).
+  timestamp_column: "Timestamp"
+  afternoon_file_tokens: ["afternoon", "-afternoon", "_afternoon"]
+  afternoon_hour_shift: 12
+  afternoon_shift_hour_max: 12
+  float_dtype: "float32"
+  chunk_size: 500000
+
+labels:
+  # Stage 1.3 grouping table. raw label (lowercased, punctuation-normalised)
+  # -> grouped class. Raw label is kept alongside as `Label_raw`.
+  grouping:
+    "benign": "Benign"
+    "portscan": "PortScan"
+    "dos hulk": "DoS"
+    "dos goldeneye": "DoS"
+    "dos slowloris": "DoS"
+    "dos slowhttptest": "DoS"
+    "ddos": "DDoS"
+    "ftp-patator": "Brute Force"
+    "ssh-patator": "Brute Force"
+    "web attack brute force": "Web Attack"
+    "web attack xss": "Web Attack"
+    "web attack sql injection": "Web Attack"
+    "infiltration": "Infiltration"
+    "bot": "Botnet"
+    "heartbleed": "Heartbleed"
+  # Canonical class order -> integer index (label encoding). Fixed so every
+  # model, calibrator and fusion weight uses the SAME column order.
+  class_order:
+    - "Benign"
+    - "PortScan"
+    - "DoS"
+    - "DDoS"
+    - "Brute Force"
+    - "Web Attack"
+    - "Infiltration"
+    - "Botnet"
+    - "Heartbleed"
+  benign_class: "Benign"
+  # Attack families for leave-one-attack-out (branch E).
+  attack_families:
+    - "PortScan"
+    - "DoS"
+    - "DDoS"
+    - "Brute Force"
+    - "Web Attack"
+    - "Infiltration"
+    - "Botnet"
+    - "Heartbleed"
+
+preprocessing:
+  imputer_strategy: "median"      # Stage 2.3
+  scaler: "minmax"                # Stage 2.4
+  # Behaviour for values outside the training range in val/test.
+  # "clip" -> clamp to [0,1]; "allow" -> leave outside [0,1] (documented).
+  minmax_out_of_range: "clip"
+  # Constant features (max == min) map to this constant instead of dividing by 0.
+  constant_feature_value: 0.0
+  # Session key. Equation (22) is {IPmin, IPmax, Portmin, Portmax, Protocol}.
+  #   "five_tuple"   -- equation (22) verbatim.
+  #   "service_port" -- {IPmin, IPmax, Portmin, Protocol}: drops the EPHEMERAL
+  #                     (higher) port and keeps the service (lower) port.
+  #   "host_pair"    -- {IPmin, IPmax} only.
+  # DEFAULT is "service_port". On CIC-IDS2017 the client port is ephemeral and
+  # unique per flow, so "five_tuple" yields ~1 flow per session, which makes the
+  # LSTM windows, the GNN graph and the Stage 9 sequences degenerate. See README
+  # "Deviations / Assumptions". Switch to "five_tuple" to reproduce eq. 22 exactly.
+  session_key_mode: "service_port"
+  session_key_fields: ["ip_min", "ip_max", "port_min", "port_max", "protocol"]
+  # Idle timeout (seconds): a communication key seen again after a gap longer
+  # than this starts a NEW session, exactly as NetFlow/CICFlowMeter terminate
+  # flows. Without it a host pair talking to port 80 all week is a single
+  # session spanning the whole capture, which makes the time-blocked split
+  # impossible (every session straddles every block boundary) and the LSTM
+  # windows meaningless. Set to 0 to disable.
+  session_timeout_s: 1800
+  # Hard cap on flows per session, so one noisy pair cannot dominate.
+  session_max_flows: 200
+
+# -----------------------------------------------------------------------------
+# STAGE 3: splits
+# -----------------------------------------------------------------------------
+split:
+  # "time_blocked" (MAIN), "stratified_session", "stratified_flow", "loao"
+  strategy: "time_blocked"
+  train_frac: 0.70
+  val_frac: 0.15
+  test_frac: 0.15
+  # Gap between consecutive blocks, as a fraction of the class's flow count.
+  # Flows inside the gap are dropped so no train flow is adjacent to a val flow.
+  gap_frac: 0.005
+  # Whole sessions stay on one side of every split.
+  group_by_session: true
+  # Classes with fewer than this many flows cannot be split 70/15/15 with whole
+  # sessions kept. Policy: "replicate_sessions" assigns at least one session to
+  # each partition by splitting the class at session granularity and, if the
+  # class has < 3 sessions, falls back to flow-level time ordering for that
+  # class only (logged + reported). Alternative: "flow_level".
+  tiny_class_min_flows: 30
+  tiny_class_policy: "flow_level"
+  # Guarantee every class appears in all three partitions (Stage 3.2).
+  require_all_classes_in_all_splits: true
+  stratified_flow_shuffle: true
+
+# -----------------------------------------------------------------------------
+# STAGE 4: feature selection
+# -----------------------------------------------------------------------------
+feature_selection:
+  enabled: true
+  variance_epsilon: 1.0e-5        # near-zero variance filter
+  spearman_threshold: 0.95        # |rho| > threshold -> drop one of the pair
+  spearman_sample_rows: 100000    # subsample (train only) for the rank-corr matrix
+  drop_duplicate_columns: true
+  top_k: 30                       # K per ranker (FeS Set-m)
+  vote_threshold: 4               # eta, of 8
+  n_grid: [10, 15, 20, 25, 30, 40, 50]
+  delta: 0.005                    # macro-F1 tolerance for N*
+  # Which rankers participate. Order defines the FeS Set-m numbering.
+  rankers: ["mi", "rfi", "pi_svm", "shap_lgbm", "dmm", "sd", "xgb", "lstm"]
+  cache_ranker_scores: true
+
+  mi:
+    n_neighbors: 3
+    max_rows: 50000               # stratified, per-class capped
+  rfi:
+    n_estimators: 200
+    criterion: "gini"
+    class_weight: "balanced"
+    max_rows: 200000
+    n_jobs: -1
+  pi_svm:
+    kernel: "rbf"
+    C: 1.0
+    gamma: "auto"
+    max_rows: 8000                # stratified training rows
+    holdout_frac: 0.30            # held out FROM TRAIN for the permutation score
+    n_repeats: 3
+    scoring: "macro_f1"
+    class_weight: "balanced"
+  shap_lgbm:
+    n_estimators: 200
+    learning_rate: 0.1
+    num_leaves: 31
+    class_weight: "balanced"
+    fit_max_rows: 200000
+    explain_rows: 5000            # TreeExplainer rows (stratified)
+  dmm: {}                         # |mean - median| on the scaled train feature
+  sd: {}                          # std of the scaled train feature
+  xgb:
+    n_estimators: 200
+    max_depth: 6
+    learning_rate: 0.1
+    importance_type: "gain"
+    max_rows: 300000
+    subsample: 0.9
+    colsample_bytree: 0.9
+  lstm:
+    window: 10                    # L consecutive flows per session
+    units: 64
+    dropout: 0.3
+    epochs: 10
+    batch_size: 256
+    learning_rate: 0.001
+    patience: 3
+    holdout_frac: 0.20            # held-out slice OF TRAIN for early stopping + grads
+    max_windows: 40000
+    grad_batches: 40              # number of batches used for grad x input
+
+  # N* selection probe (class-balanced LightGBM, scored on VALIDATION)
+  n_star_probe:
+    n_estimators: 150
+    learning_rate: 0.1
+    num_leaves: 31
+    class_weight: "balanced"
+    max_train_rows: 200000
+
+  # Stage 8.3 stability: repeated stratified subsamples of TRAIN
+  stability:
+    enabled: true
+    n_runs: 5
+    subsample_frac: 0.6
+
+  # Stage 8.2 ablations + sensitivity grids
+  ablation:
+    enabled: false
+    experiments:
+      - "all_features"
+      - "mi_only"
+      - "rfi_xgb"
+      - "sd_dmm_mi"
+      - "pi_svm_only"
+      - "vote_only"
+      - "vote_rank"
+      - "leave_one_ranker_out"
+      - "base_paper_six"
+      - "pcc_equal_size"
+      - "ig_equal_size"
+      - "pca_equal_size"
+  sensitivity:
+    enabled: false
+    n_values: [10, 15, 20, 25, 30, 40, 50]
+    eta_values: [3, 4, 5]
+    k_values: [10, 20, 30, 40]
+
+# -----------------------------------------------------------------------------
+# STAGE 5: imbalance handling
+# -----------------------------------------------------------------------------
+imbalance:
+  # none | class_weight | smote_enn | both   (root default = both => branch C)
+  mode: "both"
+  class_weight_formula: "balanced"   # w_c = N / (C * N_c)
+  # Whether the RESAMPLED training set is also fed to the sequence/graph models
+  # (LSTM, GNN). Default false: a SMOTE sample is an interpolated point with no
+  # session membership, no timestamp and no host, so it cannot take part in a
+  # flow window or carry a graph edge. Those two models therefore train on the
+  # original ordered training flows with class weighting only, while RF, XGBoost
+  # and the CNN train on the resampled set. Setting this true attaches each
+  # synthetic row to a singleton session, which makes the LSTM window a single
+  # padded flow and the GNN node isolated -- documented, but not recommended.
+  # See README "Deviations / Assumptions".
+  apply_to_sequence_models: false
+  sequence_models: ["lstm", "gnn"]
+  smote_enn:
+    k_neighbors: 5                   # effective k = min(k_neighbors, n_c - 1)
+    # Classes with fewer than this many TRAIN samples cannot support SMOTE
+    # interpolation meaningfully -> fallback.
+    min_samples_for_smote: 6
+    # "random_oversample" | "skip"
+    small_class_fallback: "random_oversample"
+    # Cap the majority class before resampling to keep memory bounded.
+    # null = no cap.
+    majority_cap: 300000
+    enn_n_neighbors: 3
+    # Oversampling target per class.
+    #   "full"   -- imblearn's default: every class is raised to the majority
+    #               count. This is the literal reading of "SMOTE", but on
+    #               CIC-IDS2017 it manufactures ~2.27M synthetic Heartbleed rows
+    #               from 11 real ones; the deep models then fit those synthetic
+    #               clusters and collapse (observed: train acc 0.69, val 0.10).
+    #   "capped" -- (DEFAULT) a class is raised to at most
+    #               max_oversample_ratio x its real count, and never above the
+    #               majority. Residual imbalance is handled by class weighting,
+    #               which is exactly why branch C combines the two.
+    # See README "Deviations / Assumptions".
+    target_strategy: "capped"
+    max_oversample_ratio: 20
+    sampling_strategy: "auto"
+    # ENN can delete every sample of a rare class; restore them if it does.
+    protect_rare_classes: true
+
+# -----------------------------------------------------------------------------
+# STAGE 6: classification models
+# -----------------------------------------------------------------------------
+models:
+  enabled: ["rf", "xgb", "lstm", "cnn", "gnn"]
+  rf:
+    n_estimators: 200
+    max_features: "sqrt"
+    criterion: "gini"
+    max_depth: null
+    n_jobs: -1
+    min_samples_leaf: 1
+  xgb:
+    n_estimators: 300
+    max_depth: 6
+    learning_rate: 0.1
+    subsample: 0.9
+    colsample_bytree: 0.9
+    reg_lambda: 1.0
+    reg_alpha: 0.0
+    early_stopping_rounds: 20
+    objective: "multi:softprob"
+    tree_method: "hist"
+  lstm:
+    window: 10                 # L
+    units: 64
+    dropout: 0.3
+    epochs: 20
+    batch_size: 256
+    learning_rate: 0.001
+    patience: 4
+    masking_value: 0.0
+  cnn:
+    # Exactly the Stage 6.6 architecture table.
+    conv1_filters: 64
+    conv1_kernel: 3
+    conv1_padding: "same"
+    # BatchNorm momentum for the moving mean/variance used at INFERENCE time.
+    # Keras defaults to 0.99, which needs thousands of updates to converge; with
+    # a short schedule the moving averages are still near their initialisation
+    # while the batch statistics used during training are not, so the network
+    # scores well on train and collapses on val/test. 0.9 adapts fast enough for
+    # the epoch budgets here. See README "Deviations / Assumptions".
+    batchnorm_momentum: 0.9
+    pool1: 2
+    conv2_filters: 128
+    conv2_kernel: 3
+    conv2_padding: "valid"
+    pool2: 2
+    dense_units: 128
+    dropout: 0.3
+    epochs: 20
+    batch_size: 256
+    learning_rate: 0.001
+    patience: 4
+  gnn:
+    # Nodes = sessions (see README "Deviations / Assumptions"); edges connect
+    # sessions sharing a host, restricted to past->present (time-causal).
+    node_type: "session"
+    hidden_dim: 64
+    num_layers: 2
+    dropout: 0.3
+    # Full-batch GCN: an epoch is one gradient step, so this is far larger than
+    # the mini-batch epoch counts of the LSTM/CNN.
+    epochs: 300
+    learning_rate: 0.01
+    weight_decay: 5.0e-4
+    # Time-causal edge budget per node (most recent predecessors).
+    max_in_degree: 10
+    # An edge is kept only if the two sessions start within this many seconds of
+    # each other. Multi-stage attack activity is bursty, so time locality is
+    # what makes a shared host informative; without it a workstation's whole
+    # week of traffic becomes one clique. null disables the constraint.
+    edge_max_time_gap_s: 900
+    # Linear skip from the raw node features to the output logits. A GCN layer
+    # averages over neighbours, which destroys a node's own signal when the
+    # graph has low homophily (measured on this data: edges join same-class
+    # sessions barely more often than chance). The skip keeps the node's own
+    # evidence available, so the GNN degrades to a per-session classifier when
+    # the graph is uninformative and improves on it when it is not.
+    # See README "Deviations / Assumptions".
+    residual: true
+    # Cap edges per split to bound memory.
+    max_edges: 2000000
+    batch_size: 4096
+    # If torch_geometric is unavailable, fall back to a dense-normalised-adjacency
+    # GCN implemented in plain torch (same equation 23). Logged in the report.
+    allow_torch_fallback: true
+  tuning:
+    enabled: false          # Optuna search on VALIDATION only; off by default
+    n_trials: 15
+    timeout_s: 900
+    models: ["xgb", "rf"]
+  # Predict in chunks to bound memory on 2.8M rows.
+  predict_chunk_size: 200000
+
+# -----------------------------------------------------------------------------
+# STAGE 7: adaptive evidence fusion
+# -----------------------------------------------------------------------------
+fusion:
+  # "models_only" (figure stages 1-8, 5 models) | "with_temporal" (+ SP, TC)
+  mode: "with_temporal"
+  calibration:
+    enabled: true
+    # Fitted on VALIDATION only.
+    rf: "isotonic"
+    xgb: "isotonic"
+    lstm: "isotonic"
+    cnn: "temperature"
+    gnn: "temperature"
+    isotonic_out_of_bounds: "clip"
+    temperature_max_iter: 200
+  # lambda = (lambda1 Q, lambda2 C, lambda3 K); must sum to 1.
+  lambdas: [0.5, 0.3, 0.2]
+  tune_lambdas:
+    enabled: true
+    grid_step: 0.1          # simplex grid on validation macro-F1
+  threshold:
+    # "macro_f1" -> tau_R maximising validation macro-F1
+    # "target_far" -> smallest tau_R meeting target_false_alarm_rate
+    objective: "macro_f1"
+    target_false_alarm_rate: 0.01
+    grid_points: 101
+  # Minimum events in a session for SP/TC availability a(t) (Stage 7.3).
+  min_events_for_temporal: 2
+  save_weights: true
+  ablations:
+    enabled: true
+    variants:
+      - "single_best"
+      - "equal_weights"
+      - "static_weights"       # lambda = (1,0,0)
+      - "no_confidence"        # lambda2 = 0
+      - "no_context"           # lambda3 = 0
+      - "no_temporal"          # SP, TC removed
+      - "proposed"
+
+# -----------------------------------------------------------------------------
+# STAGE 9: temporal pattern mining (extension; not in the figure)
+# -----------------------------------------------------------------------------
+temporal:
+  enabled: true
+  # Sequence unit: "session" or "host"
+  sequence_unit: "session"
+  # Event alphabet: "true_label" (train-time supervision) | "predicted_class"
+  # | "flow_state" (discretised flow behaviour, unsupervised)
+  event_definition: "flow_state"
+  flow_state:
+    # Discretisation of flow behaviour into states when event_definition=flow_state
+    n_duration_bins: 3
+    n_bytes_bins: 3
+    n_packet_bins: 3
+    binning: "quantile"      # quantile edges fitted on TRAIN only
+  max_sequence_length: 50
+  fp_growth:
+    min_support: 0.02
+    max_len: 4
+    use_mlxtend: true        # falls back to the bundled implementation
+  prefixspan:
+    min_support_frac: 0.02
+    max_pattern_len: 5
+    use_package: true        # falls back to the bundled implementation
+    top_k_patterns: 200
+  attack_state_graph:
+    # Behavioural states = grouped classes (Stage 7.3 K_i(t) lookup).
+    states: ["Benign", "PortScan", "Brute Force", "Web Attack", "DoS", "DDoS", "Botnet", "Infiltration", "Heartbleed"]
+    # Laplace smoothing for unseen transitions so K_i(t) is never exactly 0.
+    laplace_alpha: 0.1
+    self_loops: true
+  sp_normalisation: "max"    # normalise matched support by the max train support
+  save_patterns: true
+
+# -----------------------------------------------------------------------------
+# STAGE 8: evaluation
+# -----------------------------------------------------------------------------
+evaluation:
+  metrics: ["accuracy", "precision", "recall", "f1", "macro_f1", "weighted_f1",
+            "per_class", "roc_auc_ovr", "pr_auc", "ece", "brier"]
+  ece_bins: 15
+  plots:
+    confusion_matrix: true
+    confusion_matrix_normalized: true
+    roc_curves: true
+    pr_curves: true
+    reliability_diagram: true
+    feature_votes_heatmap: true
+    n_star_curve: true
+    stability_plot: true
+    attack_state_graph: true
+    top_patterns: true
+    branch_comparison: true
+  significance:
+    enabled: true
+    test: "mcnemar"            # "mcnemar" | "bootstrap"
+    bootstrap_iters: 1000
+    alpha: 0.05
+  rare_classes: ["Infiltration", "Heartbleed", "Web Attack", "Botnet"]
+
+# -----------------------------------------------------------------------------
+# SMOKE TEST overrides -- deep-merged onto the above when run.smoke_test is true.
+# Keeps every stage running, just small.
+# -----------------------------------------------------------------------------
+smoke:
+  data:
+    subsample_frac: 0.05        # stratified, rare classes kept in full
+    min_rows_per_class: 40
+  preprocessing:
+    # Short sessions in smoke mode. At ~2k rows the 15% validation band spans
+    # only minutes, so full-length sessions cannot fit inside it and every class
+    # would fall back to flow-level blocking. A shorter idle timeout keeps the
+    # session-whole code path exercised by the smoke test.
+    session_timeout_s: 90
+    session_max_flows: 25
+  feature_selection:
+    top_k: 15
+    vote_threshold: 3
+    n_grid: [5, 10, 15]
+    spearman_sample_rows: 20000
+    mi: {max_rows: 4000}
+    rfi: {n_estimators: 50, max_rows: 20000}
+    pi_svm: {max_rows: 1200, n_repeats: 2}
+    shap_lgbm: {n_estimators: 50, fit_max_rows: 20000, explain_rows: 500}
+    xgb: {n_estimators: 50, max_rows: 20000}
+    lstm: {epochs: 2, max_windows: 3000, grad_batches: 6, patience: 1}
+    n_star_probe: {n_estimators: 50, max_train_rows: 20000}
+    stability: {n_runs: 3, subsample_frac: 0.5}
+  imbalance:
+    smote_enn: {majority_cap: 20000}
+  models:
+    rf: {n_estimators: 50}
+    xgb: {n_estimators: 60, early_stopping_rounds: 10}
+    # Smoke mode has ~100x fewer gradient steps per epoch than the full run, so
+    # the neural models need a larger epoch budget and a higher learning rate
+    # here to reach the same place, not a smaller one.
+    lstm: {epochs: 40, batch_size: 128, learning_rate: 0.003, patience: 8}
+    cnn: {epochs: 30, batch_size: 128, patience: 8}
+    gnn: {epochs: 200, max_edges: 200000}
+    predict_chunk_size: 50000
+  temporal:
+    fp_growth: {min_support: 0.05}
+    prefixspan: {min_support_frac: 0.05, top_k_patterns: 50}
+  evaluation:
+    significance: {bootstrap_iters: 200}
+  seed:
+    enable_multi_seed: false

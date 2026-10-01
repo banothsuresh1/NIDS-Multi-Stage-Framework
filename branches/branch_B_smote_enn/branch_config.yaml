@@ -1,0 +1,8 @@
+# Branch B -- SMOTE-ENN only (no class weights), time-blocked split.
+run:
+  name: "branch_B_smote_enn"
+  output_dir: "branches/branch_B_smote_enn/results"
+imbalance:
+  mode: "smote_enn"
+split:
+  strategy: "time_blocked"
