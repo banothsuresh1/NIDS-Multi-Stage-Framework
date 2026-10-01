@@ -189,7 +189,7 @@ def rank_pi_svm(X: pd.DataFrame, y: np.ndarray, cfg: Mapping[str, Any],
     test (Stage 4.5, "Why a held-out slice").
     """
     from sklearn.inspection import permutation_importance
-    from sklearn.metrics import f1_score, make_scorer
+    from sklearn.metrics import f1_score
     from sklearn.model_selection import train_test_split
     from sklearn.svm import SVC
 
@@ -209,9 +209,23 @@ def rank_pi_svm(X: pd.DataFrame, y: np.ndarray, cfg: Mapping[str, Any],
         random_state=seed,
     ).fit(Xa, ya)
 
-    scorer = make_scorer(f1_score, average="macro", zero_division=0)
+    # A plain (estimator, X, y) callable rather than make_scorer: a scorer built
+    # from f1_score inherits that function's binary default pos_label=1, which
+    # sklearn then validates against the estimator's classes_. When class 1 is
+    # absent from the SVM's training sample -- which is exactly what branch E
+    # does when it holds out PortScan -- that validation raises
+    # "pos_label=1 is not a valid label". A direct callable sidesteps the
+    # binary-metric machinery entirely.
+    scoring = str(p.get("scoring", "macro_f1"))
+    average = {"macro_f1": "macro", "weighted_f1": "weighted",
+               "micro_f1": "micro"}.get(scoring, "macro")
+
+    def macro_f1_scorer(estimator, X_eval, y_eval) -> float:
+        return float(f1_score(y_eval, estimator.predict(X_eval),
+                              average=average, zero_division=0))
+
     result = permutation_importance(
-        svm, Xb, yb, scoring=scorer, n_repeats=int(p.get("n_repeats", 3)),
+        svm, Xb, yb, scoring=macro_f1_scorer, n_repeats=int(p.get("n_repeats", 3)),
         random_state=seed, n_jobs=1,
     )
     return result.importances_mean.astype(np.float64)

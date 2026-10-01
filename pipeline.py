@@ -119,6 +119,10 @@ def run_pipeline(
                 use_cache=bool(cfg["run"].get("use_cache", True)))
     dist = dp.class_distribution_table(df, cfg)
     save_table(dist, out_dir / "class_distribution.csv")
+    # prepare_dataset returns early on a parquet cache hit, so the Stage 2
+    # report is written here rather than there -- otherwise a cached run leaves
+    # results/ without it.
+    save_json(prep_report, out_dir / "preprocessing_report.json")
     if make_plots:
         ev.plot_class_distribution(dist, cfg, out_dir / "class_distribution.png")
 

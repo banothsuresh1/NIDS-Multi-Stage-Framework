@@ -20,6 +20,7 @@ Run standalone::
 """
 
 import sys
+import traceback
 from pathlib import Path
 
 import numpy as np
@@ -81,7 +82,8 @@ def main() -> None:
                 df_cache=(df, feature_columns, prep_report),
             )
         except Exception as exc:
-            LOGGER.error("Branch E: %s failed (%s)", family, exc)
+            LOGGER.error("Branch E: %s failed (%s)\n%s", family, exc,
+                         traceback.format_exc())
             rows.append({"held_out_family": family, "n_unseen": n,
                          "status": f"failed: {exc}"})
             continue

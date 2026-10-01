@@ -521,6 +521,13 @@ normalised-adjacency GCN implementing eq. 23 is the documented fallback
 * **Metrics in this repository come from a synthetic fixture.** No numbers here
   should be read as CIC-IDS2017 results; the fixture exists to exercise the code
   paths and the leakage guards. Run on the real data to obtain results.
+* **The fixture cannot show a leakage gap, and does not.** Branch D on the
+  synthetic data reports flow-level and time-blocked macro-F1 within ~0.001 of
+  each other. That is the expected outcome, not a refutation of the premise: the
+  generator draws each flow independently, so a session carries no
+  near-duplicate flows for a torn split to leak across. The gap is a property of
+  real captures, where consecutive flows of one session are highly redundant.
+  Branch D is wired and reported; only real data can populate it meaningfully.
 * **Session-level time blocking costs data.** Sessions overlapping a block
   boundary are discarded. On dense captures this is a small percentage, but the
   fraction is reported per run and should be checked.
