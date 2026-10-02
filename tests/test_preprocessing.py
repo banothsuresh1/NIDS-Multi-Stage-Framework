@@ -173,3 +173,29 @@ def test_cache_signature_separates_modes_and_sources(cfg):
     # The signature is carried into every cached artifact name.
     for c in (full, smoke, other):
         assert utils.cache_path(c, "ranker_mi.joblib").name.startswith(utils.data_signature(c))
+
+
+def test_unlabeled_rows_are_dropped_not_mapped(cfg):
+    """Blank/NaN labels and an embedded header row carry no supervision.
+
+    The public CIC-IDS2017 CSVs contain ragged rows, and a file concatenated
+    from two others carries the second file's header as data ('Label').
+    """
+    import numpy as np
+    import utils
+
+    df = pd.DataFrame({"Label": ["BENIGN", "DDoS", np.nan, "   ", "Label", "PortScan"]})
+    out = dp.group_labels(df, cfg)
+    assert out[dp.COL_LABEL].tolist() == ["Benign", "DDoS", "PortScan"]
+    assert len(out) == 3
+
+    # Opting out raises instead of dropping, so the file can be inspected.
+    strict = utils.deep_merge(cfg, {"data": {"drop_unlabeled_rows": False}})
+    with pytest.raises(ValueError, match="unmapped raw labels"):
+        dp.group_labels(pd.DataFrame({"Label": ["BENIGN", np.nan]}), strict)
+
+
+def test_a_genuinely_unknown_attack_name_still_raises(cfg):
+    """Dropping unlabeled rows must not swallow a real, unmapped attack class."""
+    with pytest.raises(ValueError, match="martian attack"):
+        dp.group_labels(pd.DataFrame({"Label": ["BENIGN", "Martian Attack"]}), cfg)

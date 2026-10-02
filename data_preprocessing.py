@@ -235,6 +235,30 @@ def group_labels(df: pd.DataFrame, cfg: Mapping[str, Any]) -> pd.DataFrame:
     norm = raw.map(_normalise_label)
     grouped = norm.map(grouping)
 
+    # Rows with no usable label. The public CIC-IDS2017 CSVs contain some blank
+    # and ragged rows, and a file that was concatenated from two others carries
+    # the second file's HEADER row as data (its Label cell reads "Label").
+    # Such a row carries no supervision: it can be neither trained on nor scored,
+    # so it is dropped rather than mapped to a class. The count is logged and
+    # kept in the preprocessing report.
+    unlabeled_tokens = {"", "nan", "none", "null", "na",
+                        _normalise_label(label_col), "label"}
+    unlabeled = grouped.isna() & norm.isin(unlabeled_tokens)
+    n_unlabeled = int(unlabeled.sum())
+
+    if n_unlabeled and cfg["data"].get("drop_unlabeled_rows", True):
+        LOGGER.warning(
+            "Stage 1: dropping %d row(s) (%.4f%%) with no usable label "
+            "(blank/NaN, or an embedded header row). Set "
+            "data.drop_unlabeled_rows: false to raise instead.",
+            n_unlabeled, 100.0 * n_unlabeled / max(len(df), 1))
+        df = df.loc[~unlabeled.to_numpy()].reset_index(drop=True)
+        raw = raw.loc[~unlabeled.to_numpy()].reset_index(drop=True)
+        norm = norm.loc[~unlabeled.to_numpy()].reset_index(drop=True)
+        grouped = grouped.loc[~unlabeled.to_numpy()].reset_index(drop=True)
+
+    # Anything still unmapped is a real label this config does not know about --
+    # that must be fixed in labels.grouping, never silently discarded.
     unmapped = sorted(set(norm[grouped.isna()].unique()))
     if unmapped:
         raise ValueError(
@@ -1106,7 +1130,9 @@ def prepare_dataset(cfg: Mapping[str, Any], data_dir: Optional[str] = None,
             f"synthetic/test folder rather than the real CIC-IDS2017 CSVs. Point "
             f"--data_dir at the real folder, or lower/clear data.expect_min_rows."
         )
+    n_before_labels = len(raw)
     raw = group_labels(raw, cfg)
+    n_unlabeled_dropped = n_before_labels - len(raw)
     raw[COL_SESSION] = build_session_ids(raw, cfg)
 
     cleaner = ColumnCleaner(cfg)
@@ -1118,6 +1144,7 @@ def prepare_dataset(cfg: Mapping[str, Any], data_dir: Optional[str] = None,
 
     feature_columns = [c for c in cleaner.feature_columns_ if c in df.columns]
     report = dict(cleaner.report_)
+    report["unlabeled_rows_dropped"] = int(n_unlabeled_dropped)
     report["n_sessions"] = int(df[COL_SESSION].nunique())
     report["time_min"] = str(df[COL_TIME].min())
     report["time_max"] = str(df[COL_TIME].max())
