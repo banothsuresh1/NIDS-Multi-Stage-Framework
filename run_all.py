@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Run the root pipeline and all five branches, then aggregate the comparison.
 
-Smoke test (minutes)::
+Full run over the real CIC-IDS2017 CSVs (the default)::
 
-    python run_all.py --data_dir data/synthetic --smoke_test
+    python run_all.py --data_dir /path/to/MachineLearningCVE
 
-Full run::
+Quick smoke test (minutes; subsampled, for plumbing checks only -- its caches and
+artifacts are written under a separate signature and never mix with a full run)::
 
-    python run_all.py --data_dir /path/to/MachineLearningCVE --full
+    python run_all.py --data_dir /path/to/MachineLearningCVE --smoke
 
 Individual branches can also be run standalone; see ``branches/*/run.py``.
 """
@@ -139,7 +140,7 @@ def main() -> int:
                   else [b for b, _ in BRANCHES])
         passthrough = []
         if args.smoke_test:
-            passthrough.append("--smoke_test")
+            passthrough.append("--smoke")
         if args.full:
             passthrough.append("--full")
         if args.no_plots:

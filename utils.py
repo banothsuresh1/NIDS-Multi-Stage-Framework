@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import random
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -162,6 +163,12 @@ def configure_frameworks(cfg: Optional[Mapping[str, Any]] = None) -> Dict[str, A
     # Keep TF quiet unless the user asked for debug output.
     os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 
+    # joblib/loky probes for physical cores and warns on Windows when it cannot
+    # ("Could not find the number of physical cores"). Pin it to the logical
+    # count (or run.loky_max_cpu_count) before any joblib pool is created.
+    n_cpu = (cfg or {}).get("run", {}).get("loky_max_cpu_count") or os.cpu_count() or 1
+    os.environ.setdefault("LOKY_MAX_CPU_COUNT", str(int(n_cpu)))
+
     try:
         import torch
 
@@ -242,7 +249,10 @@ def progress(iterable: Iterable, desc: str = "", total: Optional[int] = None,
              disable: bool = False) -> Iterator:
     """tqdm wrapper that degrades gracefully when tqdm is missing."""
     try:
-        from tqdm.auto import tqdm
+        # Plain tqdm, never tqdm.auto: the notebook flavour needs ipywidgets and
+        # prints "Error displaying widget: model not found" when it is missing or
+        # the kernel is driven by nbconvert. Text bars work everywhere.
+        from tqdm import tqdm
 
         return tqdm(iterable, desc=desc, total=total, disable=disable, leave=False)
     except Exception:  # pragma: no cover
@@ -321,8 +331,39 @@ def save_fig(fig, path: str | os.PathLike, dpi: int = 220, close: bool = True) -
     return p
 
 
+def data_signature(cfg: Mapping[str, Any]) -> str:
+    """A short tag identifying WHICH data and WHICH mode produced an artifact.
+
+    Every cache name embeds this, so a cache written by a smoke run over the
+    synthetic fixture can never be silently reused by a full run over the real
+    CIC-IDS2017 CSVs -- the filenames simply do not collide. Pointing
+    ``--data_dir`` at a different folder also changes the signature.
+
+    Example: ``full__MachineLearningCVE__noport`` vs
+    ``smoke5pct__synthetic__noport``.
+    """
+    run = cfg.get("run", {})
+    data = cfg.get("data", {})
+    if run.get("smoke_test"):
+        frac = data.get("subsample_frac")
+        mode = f"smoke{round(float(frac) * 100)}pct" if frac else "smoke"
+    else:
+        mode = "full"
+    source = Path(str(data.get("data_dir", "unknown"))).name or "unknown"
+    source = re.sub(r"[^A-Za-z0-9._-]+", "-", source)[:48]
+    port = "withport" if data.get("use_dst_port") else "noport"
+    return f"{mode}__{source}__{port}"
+
+
 def cache_path(cfg: Mapping[str, Any], name: str) -> Path:
-    """Resolve a cache filename inside the configured cache directory."""
+    """Resolve a cache filename inside the configured cache directory.
+
+    The data signature is prefixed automatically unless ``name`` already
+    carries one, so callers cannot forget it.
+    """
+    sig = data_signature(cfg)
+    if not name.startswith(sig):
+        name = f"{sig}__{name}"
     return ensure_dir(cfg.get("run", {}).get("cache_dir", "data/interim/cache")) / name
 
 

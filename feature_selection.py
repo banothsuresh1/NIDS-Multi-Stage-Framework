@@ -636,6 +636,8 @@ def run_feature_selection(
     scores: Dict[str, np.ndarray] = {}
     for name in fs["rankers"]:
         fn = RANKERS[name]
+        # joblib_cache() prefixes the data signature (mode + folder + port), so a
+        # ranker score cached by a smoke run is never reused by a full run.
         key = f"ranker_{name}_{cache_tag}_s{seed}_{len(features)}f.joblib"
 
         def produce(fn=fn, name=name):

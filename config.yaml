@@ -8,9 +8,17 @@
 
 run:
   name: "root_branch_C_both"
-  # smoke_test subsamples the data and shrinks every expensive knob so the whole
-  # pipeline (incl. all 5 branches) finishes in minutes. See `smoke` block below.
-  smoke_test: true
+  # DEFAULT IS THE FULL REAL DATASET. smoke_test subsamples the data and shrinks
+  # every expensive knob so the whole pipeline (incl. all 5 branches) finishes in
+  # minutes -- useful for a quick check, never for results. See the `smoke` block
+  # at the end of this file. Turn it on explicitly, per run:
+  #     python run_all.py --data_dir <path> --smoke
+  # Smoke artifacts are written under their own cache signature, so they can
+  # never be mistaken for or reused by a full run.
+  smoke_test: false
+  # Cap joblib/loky worker probing (avoids the physical-core warning on Windows).
+  # null -> os.cpu_count().
+  loky_max_cpu_count: null
   output_dir: "results"
   interim_dir: "data/interim"
   cache_dir: "data/interim/cache"
@@ -32,8 +40,15 @@ seed:
 # STAGE 1-2: dataset + preprocessing
 # -----------------------------------------------------------------------------
 data:
-  # Overridden by --data_dir on the CLI.
+  # Overridden by --data_dir on the CLI. Point this at the folder holding the
+  # real CIC-IDS2017 daily CSVs, e.g. on Windows:
+  #   data_dir: "C:/Users/<you>/Downloads/MachineLearningCVE"
   data_dir: "data/MachineLearningCVE"
+  # Refuse to run full-mode on an obviously too-small folder. CIC-IDS2017 is
+  # ~2,830,743 rows before duplicate removal; this catches the case where the
+  # path still points at a synthetic/test folder. null disables the check, and
+  # it is skipped in smoke mode.
+  expect_min_rows: 2000000
   csv_glob: "*.csv"
   # Columns that are identifiers/time: excluded from X, used only for ordering,
   # session grouping and graph construction (Stage 1.4 / 8.4).

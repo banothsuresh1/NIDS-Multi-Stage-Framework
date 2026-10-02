@@ -387,9 +387,12 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
     ap.add_argument("--config", default=None, help="path to config.yaml")
     ap.add_argument("--out_dir", default=None, help="override the output directory")
     ap.add_argument("--seed", type=int, default=None)
-    ap.add_argument("--smoke_test", action="store_true",
-                    help="force smoke mode (subsample + tiny epochs)")
-    ap.add_argument("--full", action="store_true", help="force full mode")
+    ap.add_argument("--smoke", "--smoke_test", dest="smoke_test", action="store_true",
+                    help="force smoke mode: stratified subsample + tiny epochs, "
+                         "written under its own cache signature (quick test only)")
+    ap.add_argument("--full", action="store_true",
+                    help="force full mode (the default; use to override a config "
+                         "that sets run.smoke_test)")
     ap.add_argument("--no_plots", action="store_true")
     ap.add_argument("--no_cache", action="store_true")
     return ap
