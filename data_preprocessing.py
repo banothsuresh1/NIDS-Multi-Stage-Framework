@@ -193,6 +193,41 @@ def load_raw_dataset(cfg: Mapping[str, Any], data_dir: Optional[str] = None) -> 
             df[COL_TIME] = _synthesise_timestamps(df, path.name, synth_start)
 
         df[COL_SRC_FILE] = path.name
+
+        # A single non-numeric cell makes pandas infer the WHOLE column as
+        # object -- and one stray row does it: a blank/ragged row, or the header
+        # row of a second CSV that was concatenated into this one. Left alone,
+        # that silently disables the float32 downcast AND the numeric cleaning in
+        # ColumnCleaner (inf, negatives and sentinels all become no-ops), and
+        # then breaks the parquet write. Coerce the feature columns back to
+        # numeric; offending cells become NaN and are imputed, while the row that
+        # caused it is dropped later by the unlabeled-label check.
+        # Identifier columns are NOT blanket-excluded: ports are numeric and must
+        # be repaired too (parquet cannot write a mixed str/int column). The
+        # "mostly parses" test below is what protects genuinely textual ids --
+        # Flow ID, IP addresses and Timestamp simply do not parse as numbers, so
+        # they are left untouched.
+        keep_as_is = {COL_TIME, COL_SRC_FILE, data_cfg["label_column"],
+                      data_cfg["timestamp_column"]}
+        repaired = []
+        for col in df.columns:
+            if col in keep_as_is or df[col].dtype != object:
+                continue
+            coerced = pd.to_numeric(df[col], errors="coerce")
+            # Only treat it as a damaged numeric column if most of it parses; a
+            # genuinely categorical column is left untouched.
+            if coerced.notna().mean() >= 0.5:
+                n_bad = int(coerced.isna().sum() - df[col].isna().sum())
+                df[col] = coerced
+                if n_bad > 0:
+                    repaired.append((col, n_bad))
+        if repaired:
+            LOGGER.warning(
+                "  [%s] %d column(s) were read as text because of malformed "
+                "cell(s); coerced back to numeric, bad cells -> NaN (e.g. %s)",
+                path.name, len(repaired),
+                ", ".join(f"{c}:{n}" for c, n in repaired[:3]))
+
         # Downcast numerics early: 2.8M x 78 float64 is ~1.7 GB, float32 halves it.
         for col in df.columns:
             if col in (COL_TIME, COL_SRC_FILE):
@@ -204,6 +239,16 @@ def load_raw_dataset(cfg: Mapping[str, Any], data_dir: Optional[str] = None) -> 
 
     merged = pd.concat(frames, ignore_index=True, sort=False)
     del frames
+
+    # Downcast again AFTER the concat. Per-file downcasting is not enough: a
+    # column that is int64 in seven files and float64 in a repaired one is
+    # promoted to float64 by the concat, which silently doubles its memory.
+    # At 2.8M rows that is hundreds of MB.
+    for col in merged.columns:
+        if col in (COL_TIME, COL_SRC_FILE):
+            continue
+        if merged[col].dtype == "float64":
+            merged[col] = merged[col].astype(float_dtype)
 
     # Deterministic global ordering: time first, then original file order.
     merged = merged.sort_values(
@@ -235,6 +280,30 @@ def group_labels(df: pd.DataFrame, cfg: Mapping[str, Any]) -> pd.DataFrame:
     norm = raw.map(_normalise_label)
     grouped = norm.map(grouping)
 
+    # Rows with no usable label. The public CIC-IDS2017 CSVs contain some blank
+    # and ragged rows, and a file that was concatenated from two others carries
+    # the second file's HEADER row as data (its Label cell reads "Label").
+    # Such a row carries no supervision: it can be neither trained on nor scored,
+    # so it is dropped rather than mapped to a class. The count is logged and
+    # kept in the preprocessing report.
+    unlabeled_tokens = {"", "nan", "none", "null", "na",
+                        _normalise_label(label_col), "label"}
+    unlabeled = grouped.isna() & norm.isin(unlabeled_tokens)
+    n_unlabeled = int(unlabeled.sum())
+
+    if n_unlabeled and cfg["data"].get("drop_unlabeled_rows", True):
+        LOGGER.warning(
+            "Stage 1: dropping %d row(s) (%.4f%%) with no usable label "
+            "(blank/NaN, or an embedded header row). Set "
+            "data.drop_unlabeled_rows: false to raise instead.",
+            n_unlabeled, 100.0 * n_unlabeled / max(len(df), 1))
+        df = df.loc[~unlabeled.to_numpy()].reset_index(drop=True)
+        raw = raw.loc[~unlabeled.to_numpy()].reset_index(drop=True)
+        norm = norm.loc[~unlabeled.to_numpy()].reset_index(drop=True)
+        grouped = grouped.loc[~unlabeled.to_numpy()].reset_index(drop=True)
+
+    # Anything still unmapped is a real label this config does not know about --
+    # that must be fixed in labels.grouping, never silently discarded.
     unmapped = sorted(set(norm[grouped.isna()].unique()))
     if unmapped:
         raise ValueError(
@@ -1106,7 +1175,9 @@ def prepare_dataset(cfg: Mapping[str, Any], data_dir: Optional[str] = None,
             f"synthetic/test folder rather than the real CIC-IDS2017 CSVs. Point "
             f"--data_dir at the real folder, or lower/clear data.expect_min_rows."
         )
+    n_before_labels = len(raw)
     raw = group_labels(raw, cfg)
+    n_unlabeled_dropped = n_before_labels - len(raw)
     raw[COL_SESSION] = build_session_ids(raw, cfg)
 
     cleaner = ColumnCleaner(cfg)
@@ -1118,6 +1189,7 @@ def prepare_dataset(cfg: Mapping[str, Any], data_dir: Optional[str] = None,
 
     feature_columns = [c for c in cleaner.feature_columns_ if c in df.columns]
     report = dict(cleaner.report_)
+    report["unlabeled_rows_dropped"] = int(n_unlabeled_dropped)
     report["n_sessions"] = int(df[COL_SESSION].nunique())
     report["time_min"] = str(df[COL_TIME].min())
     report["time_max"] = str(df[COL_TIME].max())

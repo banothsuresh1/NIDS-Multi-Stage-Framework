@@ -80,6 +80,10 @@ data:
   negative_sentinel_value: -1
   # Non-sentinel negative values in otherwise non-negative features -> NaN.
   negatives_to_nan: true
+  # Rows whose Label is blank/NaN, or that are an embedded header row from a
+  # concatenated CSV, carry no supervision and are dropped (count is logged and
+  # reported). false -> raise instead, so you can inspect the file first.
+  drop_unlabeled_rows: true
   drop_exact_duplicates: true
   inf_to_nan: true
   # CSV timestamps are 12-hour without AM/PM; afternoon files are shifted by
