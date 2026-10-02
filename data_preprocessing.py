@@ -193,6 +193,41 @@ def load_raw_dataset(cfg: Mapping[str, Any], data_dir: Optional[str] = None) -> 
             df[COL_TIME] = _synthesise_timestamps(df, path.name, synth_start)
 
         df[COL_SRC_FILE] = path.name
+
+        # A single non-numeric cell makes pandas infer the WHOLE column as
+        # object -- and one stray row does it: a blank/ragged row, or the header
+        # row of a second CSV that was concatenated into this one. Left alone,
+        # that silently disables the float32 downcast AND the numeric cleaning in
+        # ColumnCleaner (inf, negatives and sentinels all become no-ops), and
+        # then breaks the parquet write. Coerce the feature columns back to
+        # numeric; offending cells become NaN and are imputed, while the row that
+        # caused it is dropped later by the unlabeled-label check.
+        # Identifier columns are NOT blanket-excluded: ports are numeric and must
+        # be repaired too (parquet cannot write a mixed str/int column). The
+        # "mostly parses" test below is what protects genuinely textual ids --
+        # Flow ID, IP addresses and Timestamp simply do not parse as numbers, so
+        # they are left untouched.
+        keep_as_is = {COL_TIME, COL_SRC_FILE, data_cfg["label_column"],
+                      data_cfg["timestamp_column"]}
+        repaired = []
+        for col in df.columns:
+            if col in keep_as_is or df[col].dtype != object:
+                continue
+            coerced = pd.to_numeric(df[col], errors="coerce")
+            # Only treat it as a damaged numeric column if most of it parses; a
+            # genuinely categorical column is left untouched.
+            if coerced.notna().mean() >= 0.5:
+                n_bad = int(coerced.isna().sum() - df[col].isna().sum())
+                df[col] = coerced
+                if n_bad > 0:
+                    repaired.append((col, n_bad))
+        if repaired:
+            LOGGER.warning(
+                "  [%s] %d column(s) were read as text because of malformed "
+                "cell(s); coerced back to numeric, bad cells -> NaN (e.g. %s)",
+                path.name, len(repaired),
+                ", ".join(f"{c}:{n}" for c, n in repaired[:3]))
+
         # Downcast numerics early: 2.8M x 78 float64 is ~1.7 GB, float32 halves it.
         for col in df.columns:
             if col in (COL_TIME, COL_SRC_FILE):
@@ -204,6 +239,16 @@ def load_raw_dataset(cfg: Mapping[str, Any], data_dir: Optional[str] = None) -> 
 
     merged = pd.concat(frames, ignore_index=True, sort=False)
     del frames
+
+    # Downcast again AFTER the concat. Per-file downcasting is not enough: a
+    # column that is int64 in seven files and float64 in a repaired one is
+    # promoted to float64 by the concat, which silently doubles its memory.
+    # At 2.8M rows that is hundreds of MB.
+    for col in merged.columns:
+        if col in (COL_TIME, COL_SRC_FILE):
+            continue
+        if merged[col].dtype == "float64":
+            merged[col] = merged[col].astype(float_dtype)
 
     # Deterministic global ordering: time first, then original file order.
     merged = merged.sort_values(

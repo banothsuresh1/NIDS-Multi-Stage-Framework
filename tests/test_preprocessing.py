@@ -199,3 +199,40 @@ def test_a_genuinely_unknown_attack_name_still_raises(cfg):
     """Dropping unlabeled rows must not swallow a real, unmapped attack class."""
     with pytest.raises(ValueError, match="martian attack"):
         dp.group_labels(pd.DataFrame({"Label": ["BENIGN", "Martian Attack"]}), cfg)
+
+
+def test_malformed_cells_do_not_turn_numeric_columns_into_text(tmp_path, cfg):
+    """One stray cell must not silently disable numeric cleaning.
+
+    A blank/ragged row -- or the header row of a second CSV concatenated into
+    this one -- makes pandas infer the whole column as object. That would
+    disable the float32 downcast and turn ColumnCleaner's inf/negative/sentinel
+    handling into no-ops, then break the parquet write.
+    """
+    import numpy as np
+    import utils
+    from tests.synthetic_data import generate
+
+    generate(tmp_path, total_rows=4000, seed=5)
+    target = next(tmp_path.glob("Thursday*WebAttacks*.csv"))
+    raw = pd.read_csv(target, encoding="latin-1", low_memory=False)
+    header_row = pd.DataFrame([raw.columns.tolist()], columns=raw.columns)
+    pd.concat([raw.iloc[:100], header_row, raw.iloc[100:]],
+              ignore_index=True).to_csv(target, index=False, encoding="latin-1")
+
+    c = utils.deep_merge(cfg, {"data": {"data_dir": str(tmp_path),
+                                        "expect_min_rows": None},
+                               "run": {"interim_dir": str(tmp_path / "interim")}})
+    df, feature_columns, report = dp.prepare_dataset(c, data_dir=str(tmp_path),
+                                                     use_cache=False)
+
+    # The embedded header row is gone, and nothing numeric is left as text.
+    assert report["unlabeled_rows_dropped"] >= 1
+    assert not list(df[feature_columns].select_dtypes(include=["object"]).columns)
+    # float32 survives the repair (memory matters at 2.8M rows).
+    assert {str(d) for d in df[feature_columns].dtypes} == {"float32"}
+    # Numeric cleaning actually ran rather than silently doing nothing.
+    assert report["inf_values_to_nan"] > 0
+    assert "Init_Win_bytes_forward" in report["sentinel_features_preserved"]
+    # Genuinely textual identifiers are NOT coerced.
+    assert df["Source IP"].dtype == object
