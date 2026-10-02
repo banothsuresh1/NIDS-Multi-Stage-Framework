@@ -34,6 +34,11 @@ def cfg(tmp_path_factory) -> dict:
     c["run"]["cache_dir"] = str(tmp / "cache")
     c["run"]["model_dir"] = str(tmp / "models")
     c["run"]["use_cache"] = False
+    # The suite runs against a deliberately tiny generated fixture, so the
+    # real-dataset size guard must not fire here. (That the guard DOES fire on
+    # small data in full mode is covered by test_fixture_guard_rejects_small_data.)
+    c["run"]["smoke_test"] = True
+    c["data"]["expect_min_rows"] = None
     c["data"]["subsample_frac"] = 0.25
     # The stability loop re-runs all eight rankers n_runs times; the dedicated
     # ranker tests already cover them, so keep it out of the shared fixture.

@@ -30,6 +30,7 @@ import pandas as pd
 from utils import (
     LeakageError,
     SplitIndex,
+    data_signature,
     assert_fitted_on_train_only,
     ensure_dir,
     get_logger,
@@ -1077,10 +1078,12 @@ def prepare_dataset(cfg: Mapping[str, Any], data_dir: Optional[str] = None,
     """
     out_dir = out_dir or cfg["run"]["output_dir"]
     interim = ensure_dir(cfg["run"]["interim_dir"])
-    tag = "smoke" if cfg["run"].get("smoke_test") else "full"
-    port_tag = "withport" if cfg["data"].get("use_dst_port") else "noport"
-    cache_file = interim / f"clean_{tag}_{port_tag}.parquet"
-    meta_file = interim / f"clean_{tag}_{port_tag}.meta.json"
+    # The signature carries mode (full/smoke+frac), the data folder name and the
+    # Dst-Port flag, so a smoke cache over the fixture and a full cache over the
+    # real CSVs are different files and can never be confused for each other.
+    sig = data_signature({**cfg, "data": {**cfg["data"], "data_dir": data_dir or cfg["data"]["data_dir"]}})
+    cache_file = interim / f"clean__{sig}.parquet"
+    meta_file = interim / f"clean__{sig}.meta.json"
 
     if use_cache and cache_file.exists() and meta_file.exists():
         LOGGER.info("Stage 1-2: loading cached clean frame from %s", cache_file)
@@ -1089,7 +1092,20 @@ def prepare_dataset(cfg: Mapping[str, Any], data_dir: Optional[str] = None,
         meta = json.loads(meta_file.read_text())
         return df, meta["feature_columns"], meta["report"]
 
+    LOGGER.info("Stage 1-2: cache signature %r -> %s", sig, cache_file.name)
     raw = load_raw_dataset(cfg, data_dir)
+
+    # Fail loudly rather than quietly training on a fixture. CIC-IDS2017 is
+    # ~2.83M rows; data.expect_min_rows (null disables) catches the case where
+    # --data_dir still points at a small synthetic folder.
+    expect = cfg["data"].get("expect_min_rows")
+    if expect and not cfg["run"].get("smoke_test") and len(raw) < int(expect):
+        raise ValueError(
+            f"only {len(raw):,} rows were read from {data_dir or cfg['data']['data_dir']!r}, "
+            f"but data.expect_min_rows is {int(expect):,}. This looks like a "
+            f"synthetic/test folder rather than the real CIC-IDS2017 CSVs. Point "
+            f"--data_dir at the real folder, or lower/clear data.expect_min_rows."
+        )
     raw = group_labels(raw, cfg)
     raw[COL_SESSION] = build_session_ids(raw, cfg)
 

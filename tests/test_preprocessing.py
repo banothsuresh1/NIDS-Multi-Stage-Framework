@@ -132,3 +132,44 @@ def test_unseen_category_maps_to_all_zeros(cfg):
     onehot = [col for col in out.columns if col.startswith("Protocol=")]
     assert len(onehot) == 2                              # only 6 and 17 were seen
     assert out[onehot].to_numpy().sum() == 0.0           # unseen -> all zeros
+
+
+def test_fixture_guard_rejects_small_data(cfg, data_dir, tmp_path):
+    """Full mode must refuse an obviously-too-small folder (data.expect_min_rows).
+
+    This is the guard that stops a run silently training on a synthetic fixture
+    when --data_dir still points at test data.
+    """
+    import utils
+
+    guarded = utils.deep_merge(cfg, {
+        "run": {"smoke_test": False, "interim_dir": str(tmp_path / "interim")},
+        "data": {"expect_min_rows": 2_000_000},
+    })
+    with pytest.raises(ValueError, match="expect_min_rows"):
+        dp.prepare_dataset(guarded, data_dir=str(data_dir), use_cache=False)
+
+    # ... and allows it once the guard is cleared.
+    cleared = utils.deep_merge(guarded, {"data": {"expect_min_rows": None}})
+    df, _feats, _rep = dp.prepare_dataset(cleared, data_dir=str(data_dir), use_cache=False)
+    assert len(df) > 0
+
+
+def test_cache_signature_separates_modes_and_sources(cfg):
+    """A smoke cache and a full cache must never share a filename."""
+    import utils
+
+    full = utils.deep_merge(cfg, {"run": {"smoke_test": False},
+                                  "data": {"data_dir": "/real/MachineLearningCVE"}})
+    smoke = utils.deep_merge(cfg, {"run": {"smoke_test": True},
+                                   "data": {"data_dir": "data/synthetic",
+                                            "subsample_frac": 0.05}})
+    other = utils.deep_merge(full, {"data": {"use_dst_port": True}})
+
+    sigs = {utils.data_signature(c) for c in (full, smoke, other)}
+    assert len(sigs) == 3, f"signatures collide: {sigs}"
+    assert utils.data_signature(full).startswith("full__")
+    assert utils.data_signature(smoke).startswith("smoke")
+    # The signature is carried into every cached artifact name.
+    for c in (full, smoke, other):
+        assert utils.cache_path(c, "ranker_mi.joblib").name.startswith(utils.data_signature(c))
