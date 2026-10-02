@@ -267,7 +267,7 @@ feature_selection:
   # Stage 8.3 stability: repeated stratified subsamples of TRAIN
   stability:
     enabled: true
-    n_runs: 5
+    n_runs: 2                        # SPEED: was 5
     subsample_frac: 0.6
 
   # Stage 8.2 ablations + sensitivity grids
@@ -319,7 +319,7 @@ imbalance:
     small_class_fallback: "random_oversample"
     # Cap the majority class before resampling to keep memory bounded.
     # null = no cap.
-    majority_cap: 300000
+    majority_cap: 150000             # SPEED: was 300000
     enn_n_neighbors: 3
     # Oversampling target per class.
     #   "full"   -- imblearn's default: every class is raised to the majority
@@ -366,7 +366,7 @@ models:
     units: 64
     dropout: 0.3
     epochs: 20
-    batch_size: 256
+    batch_size: 1024               # SPEED: was 256
     learning_rate: 0.001
     patience: 4
     masking_value: 0.0
@@ -390,7 +390,7 @@ models:
     dense_units: 128
     dropout: 0.3
     epochs: 20
-    batch_size: 256
+    batch_size: 1024               # SPEED: was 256
     learning_rate: 0.001
     patience: 4
   gnn:
@@ -465,7 +465,7 @@ fusion:
   min_events_for_temporal: 2
   save_weights: true
   ablations:
-    enabled: true
+    enabled: false                   # SPEED: was true
     variants:
       - "single_best"
       - "equal_weights"
